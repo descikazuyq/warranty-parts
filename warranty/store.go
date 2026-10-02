@@ -64,17 +64,23 @@ type Commitment struct {
 	Expiry time.Time
 	// Canceled 表示是否已被取消。
 	Canceled bool
+	// Expired 表示是否已被确认到期。到期只释放未用占用，不抹去已用数量，且
+	// 不可撤销：一经确认，即使后续调用传入更早的当前时刻，也不再恢复占用、
+	// 新使用一律被拒。
+	Expired bool
 }
 
 // Unused 返回未用数量。
 func (c *Commitment) Unused() int { return c.Quantity - c.Used }
 
 // Status 返回承诺在指定当前时刻的状态。
+// 到期是单向、不可撤销的：一旦被确认到期（Expired 为真），无论调用方传入多早
+// 的当前时刻都保持 expired；取消同样优先于时刻判断。
 func (c *Commitment) Status(now time.Time) CommitmentStatus {
 	switch {
 	case c.Canceled:
 		return CommitmentCanceled
-	case !now.Before(c.Expiry):
+	case c.Expired || !now.Before(c.Expiry):
 		return CommitmentExpired
 	default:
 		return CommitmentActive

@@ -62,6 +62,20 @@ func toDetailLocked(c *Commitment, now time.Time) CommitmentDetail {
 	}
 }
 
+// confirmExpiryForRequestLocked 在已持锁的情况下，将指定请求关联的、在当前时刻
+// 已到期的未取消承诺确认为已到期。到期不可撤销：确认后即使传入更早的当前时刻，
+// 这些承诺也不再恢复占用。本函数只处理该请求涉及的承诺。
+func (s *Store) confirmExpiryForRequestLocked(requestID string, now time.Time) {
+	for _, c := range s.commitments {
+		if c.RequestID != requestID || c.Canceled || c.Expired {
+			continue
+		}
+		if !now.Before(c.Expiry) {
+			c.Expired = true
+		}
+	}
+}
+
 // RequestView 返回指定请求在当前时刻的资格依据、拒绝原因和关联承诺。
 func (s *Store) RequestView(requestID string, now time.Time) (*RequestView, error) {
 	if requestID == "" {
@@ -74,6 +88,8 @@ func (s *Store) RequestView(requestID string, now time.Time) (*RequestView, erro
 	if !ok {
 		return nil, fmt.Errorf("%w: request %q", ErrNotFound, requestID)
 	}
+	// 明细查询确认本请求涉及的已到期承诺，到期释放不可撤销。
+	s.confirmExpiryForRequestLocked(requestID, now)
 	elig, err := s.evaluateLocked(req, now)
 	if err != nil {
 		return nil, err
@@ -103,13 +119,15 @@ func (s *Store) PartStatus(partID string, now time.Time) (*PartStatus, error) {
 	if !ok {
 		return nil, fmt.Errorf("%w: part %q", ErrNotFound, partID)
 	}
+	// 库存查询确认本备件涉及的已到期承诺，到期释放不可撤销。
+	s.confirmExpiryLocked(partID, now)
 	view := &PartStatus{PartID: partID, PhysicalRemaining: part.Stock}
 	for _, c := range s.commitments {
 		if c.PartID != partID {
 			continue
 		}
 		view.Details = append(view.Details, toDetailLocked(c, now))
-		if !c.Canceled && now.Before(c.Expiry) {
+		if !c.Canceled && !c.Expired && now.Before(c.Expiry) {
 			view.ActiveOccupied += c.Quantity - c.Used
 		}
 	}

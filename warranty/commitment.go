@@ -6,19 +6,35 @@ import (
 )
 
 // activeOccupiedLocked 返回某备件在指定当前时刻的有效承诺未用总量。
-// 已取消或已到期的承诺不计入占用。
+// 已取消或已确认到期的承诺不计入占用；到期不可撤销，确认后即使传入更早的
+// 当前时刻也不再计入。
 func (s *Store) activeOccupiedLocked(partID string, now time.Time) int {
 	total := 0
 	for _, c := range s.commitments {
-		if c.PartID != partID {
+		if c.PartID != partID || c.Canceled || c.Expired {
 			continue
 		}
-		if c.Canceled || !now.Before(c.Expiry) {
+		if !now.Before(c.Expiry) {
 			continue
 		}
 		total += c.Quantity - c.Used
 	}
 	return total
+}
+
+// confirmExpiryLocked 在已持锁的情况下，将指定备件在当前时刻已到期的未取消
+// 承诺确认为已到期。到期只释放未用占用，不抹去已用数量，且不可撤销：确认后
+// 即使后续调用传入更早的当前时刻，这些承诺也不再恢复占用，新使用一律被拒。
+// 本函数只处理该备件涉及的承诺；原样重试与提前失败的调用不调用它。
+func (s *Store) confirmExpiryLocked(partID string, now time.Time) {
+	for _, c := range s.commitments {
+		if c.PartID != partID || c.Canceled || c.Expired {
+			continue
+		}
+		if !now.Before(c.Expiry) {
+			c.Expired = true
+		}
+	}
 }
 
 // Reserve 为请求预留一种备件，数量为正整数，到期时刻必须晚于本次提交的当前时刻。
@@ -107,6 +123,10 @@ func (s *Store) Reserve(commitID, requestID, partID string, quantity int, expiry
 		})
 		return Commitment{}, err
 	}
+
+	// 库存核算：先确认本备件在当前时刻已到期的承诺，到期释放不可撤销；
+	// 库存不足等后续失败也不改变已确认的到期事实。
+	s.confirmExpiryLocked(partID, now)
 
 	// 库存依据：本次提交处理前的实物剩余、有效占用与可承诺数量。
 	stockBasis := &StockBasis{
@@ -198,7 +218,14 @@ func (s *Store) Use(usageID, commitID string, quantity int, now time.Time) (Usag
 	if c.Canceled {
 		return Usage{}, fmt.Errorf("%w: commitment %q is canceled", ErrCommitmentClosed, commitID)
 	}
+	if c.Expired {
+		// 已确认到期：即使本次时刻早于到期时刻也不再开放，新使用一律拒绝。
+		return Usage{}, fmt.Errorf("%w: commitment %q is expired", ErrCommitmentClosed, commitID)
+	}
 	if !now.Before(c.Expiry) {
+		// 本次使用判断确认承诺到期：到期只释放未用占用，不抹去已用数量，
+		// 且不可撤销——之后即使传入更早的时刻也不能再次使用或占用。
+		c.Expired = true
 		return Usage{}, fmt.Errorf("%w: commitment %q expired at %v", ErrCommitmentClosed, commitID, c.Expiry)
 	}
 	if quantity > c.Quantity-c.Used {
