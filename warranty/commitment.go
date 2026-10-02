@@ -21,35 +21,34 @@ func (s *Store) activeOccupiedLocked(partID string, now time.Time) int {
 	return total
 }
 
-// Reserve 为请求预留一种备件，数量为正整数，到期时刻必须晚于当前时刻。
-// 每次预留都按当次时刻重新判断资格；可承诺数量等于剩余实物库存扣除所有
+// Reserve 为请求预留一种备件，数量为正整数，到期时刻必须晚于本次提交的当前时刻。
+// 每次首次预留都按当次时刻重新判断资格；可承诺数量等于剩余实物库存扣除所有
 // 有效承诺的未用数量。库存不足、未知请求或备件、不合格请求都不占用数量。
 //
-// 提交编号全局唯一：相同编号且相同内容的重试返回同一承诺，不追加历史；
-// 换请求、备件、数量或到期时刻则返回 ErrConflict，并在本次提交指定的已知
-// 请求下记录失败。每次首次预留成功及每次失败提交都会在对应请求下留下记录。
+// 提交编号全局唯一。已成功的编号：
+//   - 原样重试（请求编号、备件编号、数量和到期时刻一致；当前时刻不属于提交内容，
+//     到期时刻按实际时刻比较，换时区表示仍算一致）只取回首次预留成功的完整承诺，
+//     其中已用数量仍为零、取消标记仍为否，不重新判断资格与库存，不重复占用，不
+//     追加历史，也不恢复已释放占用或补回已扣减的实物库存；无论请求后来过保、库存
+//     不足，还是承诺已分批使用、全部使用、取消或到期，即使本次当前时刻等于或晚于
+//     原到期时刻，均如此。
+//   - 改请求、备件、数量或到期时刻任一项即返回 ErrConflict，即使新参数本身非法
+//     （空请求、未知备件、零数量、已过去的到期时刻）也按编号冲突处理；失败记录挂在
+//     本次提交指定的已知请求下，请求为空或不存在时不创建请求和历史。
+//
+// 尚未成功占用的编号继续按本次参数、资格和库存判断；失败记录照常保留，失败后允许
+// 用该编号再次提交。每次首次预留成功及每次失败提交都会在对应请求下留下记录。
 func (s *Store) Reserve(commitID, requestID, partID string, quantity int, expiry, now time.Time) (Commitment, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if commitID == "" || requestID == "" || partID == "" {
-		s.recordInvalidParamLocked(requestID, commitID, partID, quantity, expiry, now)
-		return Commitment{}, fmt.Errorf("%w: commit/request/part id must not be empty", ErrInvalidParam)
-	}
-	if quantity <= 0 {
-		s.recordInvalidParamLocked(requestID, commitID, partID, quantity, expiry, now)
-		return Commitment{}, fmt.Errorf("%w: reserve quantity must be a positive integer", ErrInvalidParam)
-	}
-	if !expiry.After(now) {
-		s.recordInvalidParamLocked(requestID, commitID, partID, quantity, expiry, now)
-		return Commitment{}, fmt.Errorf("%w: expiry must be after current time", ErrInvalidParam)
-	}
-
-	// 幂等重试：同编号同内容返回首次结果，不追加历史，不重复占用。
-	if existing, ok := s.commitments[commitID]; ok {
-		if existing.RequestID != requestID || existing.PartID != partID ||
-			existing.Quantity != quantity || !existing.Expiry.Equal(expiry) {
-			// 冲突：在本次提交指定的已知请求下记录失败，不挂到原承诺所属请求。
+	// 已成功的编号优先按重复提交处理，优先于本次参数校验：原样重试不因本次当前
+	// 时刻晚于到期时刻等参数问题失败；改内容则一律冲突。
+	if first, ok := s.firstResults[commitID]; ok {
+		if first.RequestID != requestID || first.PartID != partID ||
+			first.Quantity != quantity || !first.Expiry.Equal(expiry) {
+			// 冲突：在本次提交指定的已知请求下记录失败，不挂到原承诺所属请求，
+			// 请求为空或不存在时不创建请求和历史。
 			if _, known := s.requests[requestID]; known {
 				s.appendHistoryLocked(requestID, HistoryRecord{
 					CommitID: commitID,
@@ -62,7 +61,21 @@ func (s *Store) Reserve(commitID, requestID, partID string, quantity int, expiry
 			}
 			return Commitment{}, fmt.Errorf("%w: commit id %q reused with different content", ErrConflict, commitID)
 		}
-		return *existing, nil
+		// 原样重试：返回首次成功时的承诺快照，不反映后来的使用、取消或到期。
+		return first, nil
+	}
+
+	if commitID == "" || requestID == "" || partID == "" {
+		s.recordInvalidParamLocked(requestID, commitID, partID, quantity, expiry, now)
+		return Commitment{}, fmt.Errorf("%w: commit/request/part id must not be empty", ErrInvalidParam)
+	}
+	if quantity <= 0 {
+		s.recordInvalidParamLocked(requestID, commitID, partID, quantity, expiry, now)
+		return Commitment{}, fmt.Errorf("%w: reserve quantity must be a positive integer", ErrInvalidParam)
+	}
+	if !expiry.After(now) {
+		s.recordInvalidParamLocked(requestID, commitID, partID, quantity, expiry, now)
+		return Commitment{}, fmt.Errorf("%w: expiry must be after current time", ErrInvalidParam)
 	}
 
 	req, ok := s.requests[requestID]
@@ -137,9 +150,11 @@ func (s *Store) Reserve(commitID, requestID, partID string, quantity int, expiry
 		Quantity:  quantity,
 		Expiry:    expiry,
 	}
-	// 成功记录与承诺在同一把锁内同时落库，查询不会看到只占用库存却没有
-	// 成功记录的中间状态。
+	// 成功记录、承诺与首次结果快照在同一把锁内同时落库，查询不会看到只占用库存
+	// 却没有成功记录的中间状态；快照独立于活动承诺，之后的使用、取消或到期不
+	// 会改变原样重试取回的值。
 	s.commitments[commitID] = c
+	s.firstResults[commitID] = *c
 	s.appendHistoryLocked(requestID, HistoryRecord{
 		CommitID:    commitID,
 		PartID:      partID,

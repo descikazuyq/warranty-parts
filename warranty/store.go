@@ -99,6 +99,9 @@ type Store struct {
 	requests    map[string]*Request
 	commitments map[string]*Commitment
 	usages      map[string]*Usage
+	// firstResults 保存每个承诺编号首次预留成功时返回的承诺快照（已用数量为零、
+	// 未取消）。原样重试取回它，不随分批使用、取消或到期改变。
+	firstResults map[string]Commitment
 	// history 保存按请求分组的预留处理历史，仅存在于当前仓库实例中。
 	history map[string][]HistoryRecord
 }
@@ -106,12 +109,13 @@ type Store struct {
 // NewStore 创建一个空的保修备件仓库。
 func NewStore() *Store {
 	return &Store{
-		products:    make(map[string]*Product),
-		parts:       make(map[string]*Part),
-		requests:    make(map[string]*Request),
-		commitments: make(map[string]*Commitment),
-		usages:      make(map[string]*Usage),
-		history:     make(map[string][]HistoryRecord),
+		products:     make(map[string]*Product),
+		parts:        make(map[string]*Part),
+		requests:     make(map[string]*Request),
+		commitments:  make(map[string]*Commitment),
+		usages:       make(map[string]*Usage),
+		firstResults: make(map[string]Commitment),
+		history:      make(map[string][]HistoryRecord),
 	}
 }
 
