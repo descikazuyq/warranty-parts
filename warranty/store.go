@@ -60,20 +60,60 @@ type Commitment struct {
 	Quantity int
 	// Used 是已成功使用的累计数量。
 	Used int
-	// Expiry 是到期时刻；当前时刻等于或晚于它时承诺自动失效。
+	// Expiry 是到期时刻；当前时刻等于或晚于它时承诺到期，余量释放。
 	Expiry time.Time
 	// Canceled 表示是否已被取消。
 	Canceled bool
+	// Expired 表示到期是否已被确认。到期确认是不可逆的结果：一经确认，
+	// 未用占用永久释放，之后即使传入更早的当前时刻也仍视为到期，不能重新
+	// 占用已释放给其他请求的数量。未确认前仅在当次时刻达到到期时刻时
+	// （库存查询、请求查询、新预留核算、新使用判断）就本次涉及的承诺确认。
+	// 幂等重试、参数非法或引用对象不存在而提前失败的调用不确认到期。
+	Expired bool
 }
 
 // Unused 返回未用数量。
 func (c *Commitment) Unused() int { return c.Quantity - c.Used }
 
-// Status 返回承诺在指定当前时刻的状态。
+// confirmExpiryLocked 在已持锁的情况下按本次当前时刻确认单笔承诺到期。
+// 仅确认本次操作涉及的承诺：未取消、尚未确认且当前时刻已达到到期时刻时
+// 置位 Expired；该结果不可逆。已取消的承诺保持 canceled，不确认到期。
+func (s *Store) confirmExpiryLocked(c *Commitment, now time.Time) {
+	if c.Canceled || c.Expired {
+		return
+	}
+	if !now.Before(c.Expiry) {
+		c.Expired = true
+	}
+}
+
+// confirmPartExpiriesLocked 确认指定备件下全部已到期但尚未确认的承诺。
+func (s *Store) confirmPartExpiriesLocked(partID string, now time.Time) {
+	for _, c := range s.commitments {
+		if c.PartID == partID {
+			s.confirmExpiryLocked(c, now)
+		}
+	}
+}
+
+// confirmRequestExpiriesLocked 确认指定请求下全部已到期但尚未确认的承诺。
+func (s *Store) confirmRequestExpiriesLocked(requestID string, now time.Time) {
+	for _, c := range s.commitments {
+		if c.RequestID == requestID {
+			s.confirmExpiryLocked(c, now)
+		}
+	}
+}
+
+// Status 返回承诺的当前状态。
+// 已确认到期不可逆：即使传入更早的当前时刻也显示 expired；状态不要求
+// 调用时刻递增。取消优先于到期，已取消的记录始终显示 canceled。
 func (c *Commitment) Status(now time.Time) CommitmentStatus {
 	switch {
 	case c.Canceled:
 		return CommitmentCanceled
+	case c.Expired:
+		return CommitmentExpired
 	case !now.Before(c.Expiry):
 		return CommitmentExpired
 	default:

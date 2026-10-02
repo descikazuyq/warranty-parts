@@ -5,15 +5,17 @@ import (
 	"time"
 )
 
-// activeOccupiedLocked 返回某备件在指定当前时刻的有效承诺未用总量。
-// 已取消或已到期的承诺不计入占用。
-func (s *Store) activeOccupiedLocked(partID string, now time.Time) int {
+// activeOccupiedLocked 返回某备件当前仍有效承诺的未用总量。
+// 已取消或已确认到期的承诺不计入占用；到期一经确认不可逆，与本次传入的
+// 当前时刻无关，因此这里不再接收当前时刻，时刻相关的到期确认由调用方
+// 在核算前对本次涉及的承诺显式完成。
+func (s *Store) activeOccupiedLocked(partID string) int {
 	total := 0
 	for _, c := range s.commitments {
 		if c.PartID != partID {
 			continue
 		}
-		if c.Canceled || !now.Before(c.Expiry) {
+		if c.Canceled || c.Expired {
 			continue
 		}
 		total += c.Quantity - c.Used
@@ -24,6 +26,12 @@ func (s *Store) activeOccupiedLocked(partID string, now time.Time) int {
 // Reserve 为请求预留一种备件，数量为正整数，到期时刻必须晚于本次提交的当前时刻。
 // 每次首次预留都按当次时刻重新判断资格；可承诺数量等于剩余实物库存扣除所有
 // 有效承诺的未用数量。库存不足、未知请求或备件、不合格请求都不占用数量。
+//
+// 新预留的库存核算会先按本次当前时刻确认该备件下已到期的承诺：当前时刻达到
+// 其到期时刻的未取消承诺被永久标记到期，只释放未用占用、不增加实物库存；该
+// 结果不可逆，之后即使传入更早时刻核算也不再计算其未用数量，不能再次占用已
+// 释放给其他请求的数量。空编号、非正数量等参数非法，或请求、备件（含资格所
+// 需产品）不存在而提前失败的调用，不用本次时刻确认任何承诺。
 //
 // 提交编号全局唯一。已成功的编号：
 //   - 原样重试（请求编号、备件编号、数量和到期时刻一致；当前时刻不属于提交内容，
@@ -108,10 +116,15 @@ func (s *Store) Reserve(commitID, requestID, partID string, quantity int, expiry
 		return Commitment{}, err
 	}
 
+	// 库存核算前先按本次时刻确认该备件已到期的承诺。到期确认不可逆，之后
+	// 即使传入更早时刻也不再计入占用。放在参数与引用校验之后：提前失败的
+	// 非法或缺失引用调用不确认任何承诺。
+	s.confirmPartExpiriesLocked(partID, now)
+
 	// 库存依据：本次提交处理前的实物剩余、有效占用与可承诺数量。
 	stockBasis := &StockBasis{
 		PhysicalRemaining: part.Stock,
-		ActiveOccupied:    s.activeOccupiedLocked(partID, now),
+		ActiveOccupied:    s.activeOccupiedLocked(partID),
 	}
 	stockBasis.Committable = stockBasis.PhysicalRemaining - stockBasis.ActiveOccupied
 
@@ -171,9 +184,13 @@ func (s *Store) Reserve(commitID, requestID, partID string, quantity int, expiry
 // Use 使用一笔承诺，数量为正整数，分批扣减该承诺未用数量和剩余实物库存。
 // 数量超过未用数量时整次失败，不改变任何记录。
 //
-// 使用编号全局唯一：相同编号且相同内容的重试返回首次成功结果，不再次扣减；
-// 改数量或改承诺返回 ErrConflict。已经成功的使用在承诺取消或到期后重试，
-// 仍返回原结果。已全部使用的承诺不再接受新使用。
+// 使用编号全局唯一：相同编号且相同内容的重试返回首次成功结果，不再次扣减，
+// 也不借本次时刻确认任何承诺到期；改数量或改承诺返回 ErrConflict。已经成功
+// 的使用在承诺取消或到期后重试，仍返回原结果，已确认到期的承诺也不会因此重
+// 新开放。新使用（非重试）会按本次当前时刻确认这一笔承诺：已取消或已确认到
+// 期，或本次时刻达到其到期时刻的，一律返回 ErrCommitmentClosed；到期一经确认
+// 不可逆，之后即使传入更早时刻也仍被拒绝。参数非法或承诺不存在而提前失败
+// 时，不用本次时刻确认到期。已全部使用的承诺不再接受新使用。
 func (s *Store) Use(usageID, commitID string, quantity int, now time.Time) (Usage, error) {
 	if usageID == "" || commitID == "" {
 		return Usage{}, fmt.Errorf("%w: usage/commit id must not be empty", ErrInvalidParam)
@@ -195,10 +212,13 @@ func (s *Store) Use(usageID, commitID string, quantity int, now time.Time) (Usag
 	if !ok {
 		return Usage{}, fmt.Errorf("%w: commitment %q", ErrNotFound, commitID)
 	}
+	// 新使用判断：按本次时刻确认这一笔承诺是否到期。一经确认不可逆，之后
+	// 即使传入更早时刻也一律关闭。已取消的承诺不确认到期，仍保持 canceled。
+	s.confirmExpiryLocked(c, now)
 	if c.Canceled {
 		return Usage{}, fmt.Errorf("%w: commitment %q is canceled", ErrCommitmentClosed, commitID)
 	}
-	if !now.Before(c.Expiry) {
+	if c.Expired {
 		return Usage{}, fmt.Errorf("%w: commitment %q expired at %v", ErrCommitmentClosed, commitID, c.Expiry)
 	}
 	if quantity > c.Quantity-c.Used {

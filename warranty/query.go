@@ -63,6 +63,10 @@ func toDetailLocked(c *Commitment, now time.Time) CommitmentDetail {
 }
 
 // RequestView 返回指定请求在当前时刻的资格依据、拒绝原因和关联承诺。
+// 查询会按本次当前时刻确认该请求下已到期的承诺：到期一经确认不可逆，之后
+// 即使传入更早时刻，这些承诺也始终显示 expired、不再计入有效占用；到期时刻
+// 前尚未确认失效的承诺仍按本次时刻显示 active。资格仍只按本次时刻判断，
+// 不会用较大的历史时刻替换本次时刻。
 func (s *Store) RequestView(requestID string, now time.Time) (*RequestView, error) {
 	if requestID == "" {
 		return nil, fmt.Errorf("%w: request id must not be empty", ErrInvalidParam)
@@ -74,6 +78,9 @@ func (s *Store) RequestView(requestID string, now time.Time) (*RequestView, erro
 	if !ok {
 		return nil, fmt.Errorf("%w: request %q", ErrNotFound, requestID)
 	}
+	// 查询本身确认到期：本次时刻已达到到期时刻的关联承诺一经确认不可逆，
+	// 之后即使传入更早时刻也不再计入占用、状态保持 expired。
+	s.confirmRequestExpiriesLocked(requestID, now)
 	elig, err := s.evaluateLocked(req, now)
 	if err != nil {
 		return nil, err
@@ -92,6 +99,9 @@ func (s *Store) RequestView(requestID string, now time.Time) (*RequestView, erro
 }
 
 // PartStatus 返回指定备件在当前时刻的实物剩余、有效占用、可承诺数量和占用明细。
+// 查询会按本次当前时刻确认该备件下已到期的承诺：到期一经确认不可逆，只释放
+// 未用占用、不增加实物库存，之后即使传入更早时刻，这些承诺也不再计入有效占用
+// （可承诺数量不回落），明细持续显示 expired；已取消的记录仍显示 canceled。
 func (s *Store) PartStatus(partID string, now time.Time) (*PartStatus, error) {
 	if partID == "" {
 		return nil, fmt.Errorf("%w: part id must not be empty", ErrInvalidParam)
@@ -103,13 +113,17 @@ func (s *Store) PartStatus(partID string, now time.Time) (*PartStatus, error) {
 	if !ok {
 		return nil, fmt.Errorf("%w: part %q", ErrNotFound, partID)
 	}
+	// 查询本身确认到期：本次时刻已达到到期时刻的该备件承诺一经确认不可
+	// 逆，之后即使传入更早时刻也不再计入占用。
+	s.confirmPartExpiriesLocked(partID, now)
 	view := &PartStatus{PartID: partID, PhysicalRemaining: part.Stock}
 	for _, c := range s.commitments {
 		if c.PartID != partID {
 			continue
 		}
 		view.Details = append(view.Details, toDetailLocked(c, now))
-		if !c.Canceled && now.Before(c.Expiry) {
+		// 占用只看持久状态：取消或已确认到期的承诺不占数量，不随本次时刻回退。
+		if !c.Canceled && !c.Expired {
 			view.ActiveOccupied += c.Quantity - c.Used
 		}
 	}
