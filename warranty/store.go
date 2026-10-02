@@ -99,6 +99,8 @@ type Store struct {
 	requests    map[string]*Request
 	commitments map[string]*Commitment
 	usages      map[string]*Usage
+	// history 按请求保存预留处理记录，只增不改；记录只存在于当前仓库实例中。
+	history map[string][]*HistoryEntry
 }
 
 // NewStore 创建一个空的保修备件仓库。
@@ -109,6 +111,7 @@ func NewStore() *Store {
 		requests:    make(map[string]*Request),
 		commitments: make(map[string]*Commitment),
 		usages:      make(map[string]*Usage),
+		history:     make(map[string][]*HistoryEntry),
 	}
 }
 
