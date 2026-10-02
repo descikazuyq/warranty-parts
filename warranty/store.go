@@ -99,6 +99,10 @@ type Store struct {
 	requests    map[string]*Request
 	commitments map[string]*Commitment
 	usages      map[string]*Usage
+	// originals 保存首次预留成功时的承诺快照：已用数量始终为零、取消标记始终为否，
+	// 不随后续的使用、取消或到期改变。原样重试只返回这份快照，不动用 commitments 中的
+	// 活记录。
+	originals map[string]*Commitment
 	// history 保存按请求分组的预留处理历史，仅存在于当前仓库实例中。
 	history map[string][]HistoryRecord
 }
@@ -111,6 +115,7 @@ func NewStore() *Store {
 		requests:    make(map[string]*Request),
 		commitments: make(map[string]*Commitment),
 		usages:      make(map[string]*Usage),
+		originals:   make(map[string]*Commitment),
 		history:     make(map[string][]HistoryRecord),
 	}
 }
