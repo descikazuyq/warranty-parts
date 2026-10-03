@@ -2,8 +2,35 @@ package warranty
 
 import (
 	"fmt"
+	"math"
 	"time"
 )
+
+// unixEpochToInternal 是 Unix 秒与 time.Time 内部绝对秒之间的固定偏移
+// （公元 1 年 1 月 1 日到 1970 年 1 月 1 日的秒数）。
+const unixEpochToInternal = 62135596800
+
+// secondsPerDay 是每天的秒数；保修期每天固定二十四小时，与时区无关。
+const secondsPerDay = 24 * 60 * 60
+
+// warrantyExpiry 计算保修截止时刻：自购买时刻起完整 days 个二十四小时。
+// 不经过 time.Duration（其上限约 106751 天），较长保修期限不会溢出回绕；
+// 秒以下精度与购买时刻的时区表示原样保留。days 为正整数但截止时刻超出
+// 时间类型的可表示范围时返回 ok=false。
+func warrantyExpiry(purchase time.Time, days int) (expiry time.Time, ok bool) {
+	d := int64(days)
+	if d <= 0 || d > math.MaxInt64/secondsPerDay {
+		return time.Time{}, false
+	}
+	add := d * secondsPerDay
+	unix := purchase.Unix()
+	// 可表示的最大 Unix 秒为 math.MaxInt64 - unixEpochToInternal；
+	// 写成 unix > max-add 避免任何中间量溢出。
+	if unix > math.MaxInt64-unixEpochToInternal-add {
+		return time.Time{}, false
+	}
+	return time.Unix(unix+add, int64(purchase.Nanosecond())).In(purchase.Location()), true
+}
 
 // RejectionReason 是资格拒绝原因。
 type RejectionReason string
@@ -50,13 +77,15 @@ func (s *Store) evaluateLocked(req *Request, now time.Time) (*Eligibility, error
 	if req.FaultCode == "" {
 		return nil, fmt.Errorf("%w: fault code must not be empty", ErrInvalidParam)
 	}
+	// 登记时已校验截止时刻可表示，这里一定成功。
+	expiry, _ := warrantyExpiry(prod.PurchaseTime, prod.WarrantyDays)
 	e := &Eligibility{
 		RequestID:      req.ID,
 		ProductID:      prod.ID,
 		FaultCode:      req.FaultCode,
 		PurchaseTime:   prod.PurchaseTime,
 		WarrantyDays:   prod.WarrantyDays,
-		WarrantyExpiry: prod.PurchaseTime.Add(time.Duration(prod.WarrantyDays) * 24 * time.Hour),
+		WarrantyExpiry: expiry,
 	}
 	if prod.PurchaseTime.After(now) {
 		e.Reasons = append(e.Reasons, ReasonPurchaseInFuture)
