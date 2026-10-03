@@ -185,27 +185,38 @@ func (s *Store) Reserve(commitID, requestID, partID string, quantity int, expiry
 // 数量超过未用数量时整次失败，不改变任何记录。
 //
 // 使用编号全局唯一：相同编号且相同内容的重试返回首次成功结果，不再次扣减，
-// 也不借本次时刻确认任何承诺到期；改数量或改承诺返回 ErrConflict。已经成功
-// 的使用在承诺取消或到期后重试，仍返回原结果，已确认到期的承诺也不会因此重
-// 新开放。新使用（非重试）会按本次当前时刻确认这一笔承诺：已取消或已确认到
-// 期，或本次时刻达到其到期时刻的，一律返回 ErrCommitmentClosed；到期一经确认
-// 不可逆，之后即使传入更早时刻也仍被拒绝。参数非法或承诺不存在而提前失败
-// 时，不用本次时刻确认到期。已全部使用的承诺不再接受新使用。
+// 也不借本次时刻确认任何承诺到期；编号一旦已有成功记录，后续提交的承诺编号或
+// 数量与首次成功内容不同即返回 ErrConflict——即使新内容本身非法（空承诺编号、
+// 指向不存在的承诺、数量为零或负数、超过承诺余量），或新指定的承诺已取消或
+// 到期，也一律按编号冲突处理：不扣减实物库存、不改变任何承诺的已用数量、不
+// 释放占用，也不借本次时刻确认原承诺或新承诺到期，更不会用新内容覆盖原记录。
+// 已经成功的使用在承诺取消或到期后原样重试，仍返回原结果，已确认到期的承诺
+// 也不会因此重新开放。新使用（非重试）会按本次当前时刻确认这一笔承诺：已取消
+// 或已确认到期，或本次时刻达到其到期时刻的，一律返回 ErrCommitmentClosed；到期
+// 一经确认不可逆，之后即使传入更早时刻也仍被拒绝。尚无成功记录的编号按本次
+// 参数处理：空编号、空承诺编号、非正数量返回 ErrInvalidParam，引用未知承诺返回
+// ErrNotFound，这些提前失败不用本次时刻确认到期，也不占用编号，修正内容后仍可
+// 提交。已全部使用的承诺不再接受新使用。
 func (s *Store) Use(usageID, commitID string, quantity int, now time.Time) (Usage, error) {
-	if usageID == "" || commitID == "" {
-		return Usage{}, fmt.Errorf("%w: usage/commit id must not be empty", ErrInvalidParam)
-	}
-	if quantity <= 0 {
-		return Usage{}, fmt.Errorf("%w: usage quantity must be a positive integer", ErrInvalidParam)
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// 已成功的编号优先按重复提交处理，优先于本次参数校验：沿用成功编号但把
+	// 承诺编号改成空串或未知承诺、把数量改成零或负数等本身非法的内容，仍属于
+	// 对已成功提交内容的改动，按 ErrConflict 处理，与普通非法输入区分。成功
+	// 使用的编号必非空，因此空编号不会命中这里，继续走参数校验。
 	if existing, ok := s.usages[usageID]; ok {
 		if existing.CommitmentID != commitID || existing.Quantity != quantity {
 			return Usage{}, fmt.Errorf("%w: usage id %q reused with different content", ErrConflict, usageID)
 		}
 		return *existing, nil
+	}
+
+	if usageID == "" || commitID == "" {
+		return Usage{}, fmt.Errorf("%w: usage/commit id must not be empty", ErrInvalidParam)
+	}
+	if quantity <= 0 {
+		return Usage{}, fmt.Errorf("%w: usage quantity must be a positive integer", ErrInvalidParam)
 	}
 
 	c, ok := s.commitments[commitID]
