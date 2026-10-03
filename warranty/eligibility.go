@@ -2,6 +2,7 @@ package warranty
 
 import (
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -40,6 +41,33 @@ type Eligibility struct {
 	Excluded bool
 }
 
+// warrantyExpiry 计算保修截止时刻：自购买时刻起 days 个完整的二十四小时，
+// 每天固定二十四小时，不按自然日对齐，秒以下精度保留，时区只影响表示。
+// days 必须为正整数。单次 time.Duration 只能表示约 292 年的纳秒数，更长的
+// 期限分段累加以避免溢出。若截止时刻超出现有时间类型的可表示范围
+// （time.Time 内部以自元年起的 int64 秒表示），返回 ok=false。
+func warrantyExpiry(purchase time.Time, days int) (expiry time.Time, ok bool) {
+	const secondsPerDay = 24 * 60 * 60
+	// time.Time 内部秒数自元年起算，1970 年 1 月 1 日距元年 62135596800 秒，
+	// 因此可表示的最大 Unix 秒数要预留这段偏移。
+	const maxUnix = math.MaxInt64 - 62135596800
+	d := int64(days)
+	if d > maxUnix/secondsPerDay || purchase.Unix() > maxUnix-d*secondsPerDay {
+		return time.Time{}, false
+	}
+	// 每段 100000 天约 273.8 年，纳秒数远在 int64 范围内。
+	const chunkDays = 100000
+	t := purchase
+	for remaining := days; remaining > 0; remaining -= chunkDays {
+		n := remaining
+		if n > chunkDays {
+			n = chunkDays
+		}
+		t = t.Add(time.Duration(n) * 24 * time.Hour)
+	}
+	return t, true
+}
+
 // evaluateLocked 在已持锁的情况下计算请求在当前时刻的资格。
 // 未知产品返回 ErrNotFound，缺少故障代码返回 ErrInvalidParam。
 func (s *Store) evaluateLocked(req *Request, now time.Time) (*Eligibility, error) {
@@ -50,13 +78,15 @@ func (s *Store) evaluateLocked(req *Request, now time.Time) (*Eligibility, error
 	if req.FaultCode == "" {
 		return nil, fmt.Errorf("%w: fault code must not be empty", ErrInvalidParam)
 	}
+	// 登记时已校验期限可表示，这里不会失败。
+	expiry, _ := warrantyExpiry(prod.PurchaseTime, prod.WarrantyDays)
 	e := &Eligibility{
 		RequestID:      req.ID,
 		ProductID:      prod.ID,
 		FaultCode:      req.FaultCode,
 		PurchaseTime:   prod.PurchaseTime,
 		WarrantyDays:   prod.WarrantyDays,
-		WarrantyExpiry: prod.PurchaseTime.Add(time.Duration(prod.WarrantyDays) * 24 * time.Hour),
+		WarrantyExpiry: expiry,
 	}
 	if prod.PurchaseTime.After(now) {
 		e.Reasons = append(e.Reasons, ReasonPurchaseInFuture)

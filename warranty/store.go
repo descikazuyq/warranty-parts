@@ -12,7 +12,8 @@ type Product struct {
 	ID string
 	// PurchaseTime 是购买时刻。
 	PurchaseTime time.Time
-	// WarrantyDays 是保修天数，必须为正整数；保修期自购买时刻起，每天按二十四小时计算。
+	// WarrantyDays 是保修天数，必须为正整数，且自购买时刻起按每天二十四小时
+	// 算出的截止时刻不能超出现有时间类型的可表示范围。
 	WarrantyDays int
 	// ExcludedCodes 是除外故障代码集合；命中代码的请求一律拒绝。
 	ExcludedCodes map[string]struct{}
@@ -167,6 +168,11 @@ func (s *Store) RegisterProduct(id string, purchaseTime time.Time, warrantyDays 
 	}
 	if warrantyDays <= 0 {
 		return fmt.Errorf("%w: warranty days must be a positive integer", ErrInvalidParam)
+	}
+	// 期限对应的截止时刻必须能由现有时间类型表示；不能表示时拒绝登记，
+	// 不保存产品记录，之后以同一编号提交可表示的条款仍可登记。
+	if _, ok := warrantyExpiry(purchaseTime, warrantyDays); !ok {
+		return fmt.Errorf("%w: warranty expiry for %d days is out of representable range", ErrInvalidParam, warrantyDays)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
