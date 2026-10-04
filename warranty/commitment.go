@@ -50,23 +50,18 @@ func (s *Store) Reserve(commitID, requestID, partID string, quantity int, expiry
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// rec 汇集本次提交各分支共用的信息；原样重试在前面直接返回，不会走到这里。
+	rec := newReserveRecord(commitID, partID, quantity, expiry, now)
+
 	// 已成功的编号优先按重复提交处理，优先于本次参数校验：原样重试不因本次当前
 	// 时刻晚于到期时刻等参数问题失败；改内容则一律冲突。
 	if first, ok := s.firstResults[commitID]; ok {
 		if first.RequestID != requestID || first.PartID != partID ||
 			first.Quantity != quantity || !first.Expiry.Equal(expiry) {
-			// 冲突：在本次提交指定的已知请求下记录失败，不挂到原承诺所属请求，
-			// 请求为空或不存在时不创建请求和历史。
-			if _, known := s.requests[requestID]; known {
-				s.appendHistoryLocked(requestID, HistoryRecord{
-					CommitID: commitID,
-					PartID:   partID,
-					Quantity: quantity,
-					Expiry:   expiry,
-					Now:      now,
-					Error:    HistoryErrorConflict,
-				})
-			}
+			// 冲突：失败记录挂在本次提交指定的已知请求下，不挂到原承诺所属请求；
+			// 请求为空或不存在时不创建请求和历史，也不补任何依据。
+			rec.Error = HistoryErrorConflict
+			s.recordReserveFailureLocked(requestID, rec)
 			return Commitment{}, fmt.Errorf("%w: commit id %q reused with different content", ErrConflict, commitID)
 		}
 		// 原样重试：返回首次成功时的承诺快照，不反映后来的使用、取消或到期。
@@ -74,15 +69,18 @@ func (s *Store) Reserve(commitID, requestID, partID string, quantity int, expiry
 	}
 
 	if commitID == "" || requestID == "" || partID == "" {
-		s.recordInvalidParamLocked(requestID, commitID, partID, quantity, expiry, now)
+		rec.Error = HistoryErrorInvalidParam
+		s.recordReserveFailureLocked(requestID, rec)
 		return Commitment{}, fmt.Errorf("%w: commit/request/part id must not be empty", ErrInvalidParam)
 	}
 	if quantity <= 0 {
-		s.recordInvalidParamLocked(requestID, commitID, partID, quantity, expiry, now)
+		rec.Error = HistoryErrorInvalidParam
+		s.recordReserveFailureLocked(requestID, rec)
 		return Commitment{}, fmt.Errorf("%w: reserve quantity must be a positive integer", ErrInvalidParam)
 	}
 	if !expiry.After(now) {
-		s.recordInvalidParamLocked(requestID, commitID, partID, quantity, expiry, now)
+		rec.Error = HistoryErrorInvalidParam
+		s.recordReserveFailureLocked(requestID, rec)
 		return Commitment{}, fmt.Errorf("%w: expiry must be after current time", ErrInvalidParam)
 	}
 
@@ -92,27 +90,16 @@ func (s *Store) Reserve(commitID, requestID, partID string, quantity int, expiry
 	}
 	part, ok := s.parts[partID]
 	if !ok {
-		s.appendHistoryLocked(requestID, HistoryRecord{
-			CommitID: commitID,
-			PartID:   partID,
-			Quantity: quantity,
-			Expiry:   expiry,
-			Now:      now,
-			Error:    HistoryErrorPartNotFound,
-		})
+		// 备件缺失：资格与库存依据明确为空，不用零库存替代缺失。
+		rec.Error = HistoryErrorPartNotFound
+		s.recordReserveFailureLocked(requestID, rec)
 		return Commitment{}, fmt.Errorf("%w: part %q", ErrNotFound, partID)
 	}
 	elig, err := s.evaluateLocked(req, now)
 	if err != nil {
 		// 产品未登记：资格依据明确为空，不用合格替代缺失。
-		s.appendHistoryLocked(requestID, HistoryRecord{
-			CommitID: commitID,
-			PartID:   partID,
-			Quantity: quantity,
-			Expiry:   expiry,
-			Now:      now,
-			Error:    HistoryErrorProductNotFound,
-		})
+		rec.Error = HistoryErrorProductNotFound
+		s.recordReserveFailureLocked(requestID, rec)
 		return Commitment{}, err
 	}
 
@@ -121,38 +108,25 @@ func (s *Store) Reserve(commitID, requestID, partID string, quantity int, expiry
 	// 非法或缺失引用调用不确认任何承诺。
 	s.confirmPartExpiriesLocked(partID, now)
 
-	// 库存依据：本次提交处理前的实物剩余、有效占用与可承诺数量。
+	// 库存依据：确认相关承诺到期之后、增加本次预留之前的实物剩余、有效占用
+	// 与可承诺数量；资格不合格、库存不足与首次成功记录保存同一份快照。
 	stockBasis := &StockBasis{
 		PhysicalRemaining: part.Stock,
 		ActiveOccupied:    s.activeOccupiedLocked(partID),
 	}
 	stockBasis.Committable = stockBasis.PhysicalRemaining - stockBasis.ActiveOccupied
+	rec.Eligibility = cloneEligibility(elig)
+	rec.StockBasis = stockBasis
 
 	if !elig.Eligible {
-		s.appendHistoryLocked(requestID, HistoryRecord{
-			CommitID:    commitID,
-			PartID:      partID,
-			Quantity:    quantity,
-			Expiry:      expiry,
-			Now:         now,
-			Error:       HistoryErrorIneligible,
-			Eligibility: cloneEligibility(elig),
-			StockBasis:  stockBasis,
-		})
+		rec.Error = HistoryErrorIneligible
+		s.recordReserveFailureLocked(requestID, rec)
 		return Commitment{}, fmt.Errorf("%w: %v", ErrIneligible, elig.Reasons)
 	}
 
 	if quantity > stockBasis.Committable {
-		s.appendHistoryLocked(requestID, HistoryRecord{
-			CommitID:    commitID,
-			PartID:      partID,
-			Quantity:    quantity,
-			Expiry:      expiry,
-			Now:         now,
-			Error:       HistoryErrorInsufficientStock,
-			Eligibility: cloneEligibility(elig),
-			StockBasis:  stockBasis,
-		})
+		rec.Error = HistoryErrorInsufficientStock
+		s.recordReserveFailureLocked(requestID, rec)
 		return Commitment{}, fmt.Errorf("%w: need %d, committable %d", ErrInsufficientStock, quantity, stockBasis.Committable)
 	}
 
@@ -165,19 +139,11 @@ func (s *Store) Reserve(commitID, requestID, partID string, quantity int, expiry
 	}
 	// 成功记录、承诺与首次结果快照在同一把锁内同时落库，查询不会看到只占用库存
 	// 却没有成功记录的中间状态；快照独立于活动承诺，之后的使用、取消或到期不
-	// 会改变原样重试取回的值。
+	// 会改变原样重试取回的值，也不会改写已保存记录中的依据。
 	s.commitments[commitID] = c
 	s.firstResults[commitID] = *c
-	s.appendHistoryLocked(requestID, HistoryRecord{
-		CommitID:    commitID,
-		PartID:      partID,
-		Quantity:    quantity,
-		Expiry:      expiry,
-		Now:         now,
-		Success:     true,
-		Eligibility: cloneEligibility(elig),
-		StockBasis:  stockBasis,
-	})
+	rec.Success = true
+	s.appendHistoryLocked(requestID, rec)
 	return *c, nil
 }
 

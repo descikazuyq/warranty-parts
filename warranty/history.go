@@ -79,6 +79,20 @@ func cloneStockBasis(b *StockBasis) *StockBasis {
 	return &cp
 }
 
+// newReserveRecord 汇集一次预留提交在各分支共用的提交信息：本次指定的承诺
+// 编号、备件、数量、到期时刻与当前时刻。成功标记与失败类别一律缺省（成功为
+// false、类别为空），由唯一的落库点按实际分支设置，二者不会互相混用；资格
+// 依据与库存依据同样缺省为空，仅由取得了快照的分支挂载。
+func newReserveRecord(commitID, partID string, quantity int, expiry, now time.Time) HistoryRecord {
+	return HistoryRecord{
+		CommitID: commitID,
+		PartID:   partID,
+		Quantity: quantity,
+		Expiry:   expiry,
+		Now:      now,
+	}
+}
+
 // appendHistoryLocked 在已持锁的情况下追加一条处理记录。
 // 序号按处理次序严格递增；提交时刻相同或前后颠倒都不改变这个次序。
 func (s *Store) appendHistoryLocked(requestID string, rec HistoryRecord) {
@@ -86,22 +100,19 @@ func (s *Store) appendHistoryLocked(requestID string, rec HistoryRecord) {
 	s.history[requestID] = append(s.history[requestID], rec)
 }
 
-// recordInvalidParamLocked 在已持锁的情况下，仅当请求已知时记录一次参数无效失败。
-func (s *Store) recordInvalidParamLocked(requestID, commitID, partID string, quantity int, expiry, now time.Time) {
+// recordReserveFailureLocked 在已持锁的情况下为一次失败提交追加记录，是所有
+// 预留失败分支（参数无效、编号冲突、资格不合格、库存不足、产品或备件缺失）
+// 的唯一落库点：rec 由 newReserveRecord 构造并已设置好本次失败类别。
+// 仅当本次提交指定的请求已登记时留痕；请求为空或尚未登记时直接忽略，不创建
+// 请求或历史。调用方须保证 Success 与失败类别互斥：失败记录不带成功标记。
+func (s *Store) recordReserveFailureLocked(requestID string, rec HistoryRecord) {
 	if requestID == "" {
 		return
 	}
 	if _, ok := s.requests[requestID]; !ok {
 		return
 	}
-	s.appendHistoryLocked(requestID, HistoryRecord{
-		CommitID: commitID,
-		PartID:   partID,
-		Quantity: quantity,
-		Expiry:   expiry,
-		Now:      now,
-		Error:    HistoryErrorInvalidParam,
-	})
+	s.appendHistoryLocked(requestID, rec)
 }
 
 // RequestHistory 返回指定请求的预留处理历史，按处理次序排列，序号严格递增。
