@@ -52,6 +52,14 @@ func (s *Store) stockAccountLocked(partID string) StockBasis {
 //
 // 尚未成功占用的编号继续按本次参数、资格和库存判断；失败记录照常保留，失败后允许
 // 用该编号再次提交。每次首次预留成功及每次失败提交都会在对应请求下留下记录。
+//
+// 首次成功与编号绑定在同一临界区内原子完成：同一个尚未成功预留的编号在首次成功
+// 前被两组不同内容（不同请求、备件、数量或到期时刻）并发抢占时，只能有一份内容
+// 成为承诺，与它完全相同的并发提交全部成功并返回同一份完整的首次承诺，另一组
+// 全部 ErrConflict，不能两份内容各自成功；即使库存充足到能同时容纳两组数量，
+// 有效占用也只对应获胜内容。落败组的每次提交各在其本次指定的已知请求下留一条
+// 冲突失败记录（资格与库存依据均为空），获胜请求只留一条首次成功记录，同内容
+// 的成功重试不追加记录。
 func (s *Store) Reserve(commitID, requestID, partID string, quantity int, expiry, now time.Time) (Commitment, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
