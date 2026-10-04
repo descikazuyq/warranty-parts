@@ -105,6 +105,26 @@ func (s *Store) confirmRequestExpiriesLocked(requestID string, now time.Time) {
 	}
 }
 
+// accountPartStockLocked 是一种备件库存核算的唯一入口，库存查询与新预留共用。
+// 先按本次当前时刻确认该备件下已到期的承诺（当前时刻等于到期时刻也算到期，
+// 确认不可逆，之后即使传入更早时刻也不再计入占用），再核算确认后的数量：
+// 实物剩余为备件当前库存（只被成功使用扣减，取消或到期不补回）；有效占用为
+// 该备件所有未取消、未确认到期承诺的未用总量（已全部使用的承诺占用为零，
+// 其他备件的承诺不混入）；可承诺数量等于实物剩余减去有效占用。调用方负责在
+// 参数与引用校验通过后再进入核算，提前失败的提交不会借本次时刻确认任何承诺到期。
+func (s *Store) accountPartStockLocked(part *Part, now time.Time) StockBasis {
+	s.confirmPartExpiriesLocked(part.ID, now)
+	basis := StockBasis{PhysicalRemaining: part.Stock}
+	for _, c := range s.commitments {
+		if c.PartID != part.ID || c.Canceled || c.Expired {
+			continue
+		}
+		basis.ActiveOccupied += c.Unused()
+	}
+	basis.Committable = basis.PhysicalRemaining - basis.ActiveOccupied
+	return basis
+}
+
 // Status 返回承诺的当前状态。
 // 已确认到期不可逆：即使传入更早的当前时刻也显示 expired；状态不要求
 // 调用时刻递增。取消优先于到期，已取消的记录始终显示 canceled。

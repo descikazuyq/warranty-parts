@@ -5,24 +5,6 @@ import (
 	"time"
 )
 
-// activeOccupiedLocked 返回某备件当前仍有效承诺的未用总量。
-// 已取消或已确认到期的承诺不计入占用；到期一经确认不可逆，与本次传入的
-// 当前时刻无关，因此这里不再接收当前时刻，时刻相关的到期确认由调用方
-// 在核算前对本次涉及的承诺显式完成。
-func (s *Store) activeOccupiedLocked(partID string) int {
-	total := 0
-	for _, c := range s.commitments {
-		if c.PartID != partID {
-			continue
-		}
-		if c.Canceled || c.Expired {
-			continue
-		}
-		total += c.Quantity - c.Used
-	}
-	return total
-}
-
 // Reserve 为请求预留一种备件，数量为正整数，到期时刻必须晚于本次提交的当前时刻。
 // 每次首次预留都按当次时刻重新判断资格；可承诺数量等于剩余实物库存扣除所有
 // 有效承诺的未用数量。库存不足、未知请求或备件、不合格请求都不占用数量。
@@ -112,25 +94,20 @@ func (s *Store) Reserve(commitID, requestID, partID string, quantity int, expiry
 		return Commitment{}, err
 	}
 
-	// 库存核算前先按本次时刻确认该备件已到期的承诺。到期确认不可逆，之后
-	// 即使传入更早时刻也不再计入占用。放在参数与引用校验之后：提前失败的
-	// 非法或缺失引用调用不确认任何承诺。
-	s.confirmPartExpiriesLocked(partID, now)
-
-	// 库存依据：本次提交处理前的实物剩余、有效占用与可承诺数量。
-	stockBasis := &StockBasis{
-		PhysicalRemaining: part.Stock,
-		ActiveOccupied:    s.activeOccupiedLocked(partID),
-	}
-	stockBasis.Committable = stockBasis.PhysicalRemaining - stockBasis.ActiveOccupied
+	// 库存核算与库存查询共用同一条规则：先按本次时刻确认该备件已到期的承诺
+	// （不可逆，之后即使传入更早时刻也不再计入占用），再计算实物剩余、有效
+	// 占用与可承诺数量。核算在参数与引用校验之后：提前失败的非法或缺失引用
+	// 调用不确认任何承诺。库存依据是本次提交处理前、相关到期释放之后的快照，
+	// 成功预留不会把自己的新增占用算进依据。
+	stockBasis := s.accountPartStockLocked(part, now)
 
 	if !elig.Eligible {
-		record(false, HistoryErrorIneligible, elig, stockBasis)
+		record(false, HistoryErrorIneligible, elig, &stockBasis)
 		return Commitment{}, fmt.Errorf("%w: %v", ErrIneligible, elig.Reasons)
 	}
 
 	if quantity > stockBasis.Committable {
-		record(false, HistoryErrorInsufficientStock, elig, stockBasis)
+		record(false, HistoryErrorInsufficientStock, elig, &stockBasis)
 		return Commitment{}, fmt.Errorf("%w: need %d, committable %d", ErrInsufficientStock, quantity, stockBasis.Committable)
 	}
 
@@ -146,7 +123,7 @@ func (s *Store) Reserve(commitID, requestID, partID string, quantity int, expiry
 	// 会改变原样重试取回的值。
 	s.commitments[commitID] = c
 	s.firstResults[commitID] = *c
-	record(true, "", elig, stockBasis)
+	record(true, "", elig, &stockBasis)
 	return *c, nil
 }
 

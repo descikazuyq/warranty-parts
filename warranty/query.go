@@ -113,23 +113,24 @@ func (s *Store) PartStatus(partID string, now time.Time) (*PartStatus, error) {
 	if !ok {
 		return nil, fmt.Errorf("%w: part %q", ErrNotFound, partID)
 	}
-	// 查询本身确认到期：本次时刻已达到到期时刻的该备件承诺一经确认不可
-	// 逆，之后即使传入更早时刻也不再计入占用。
-	s.confirmPartExpiriesLocked(partID, now)
-	view := &PartStatus{PartID: partID, PhysicalRemaining: part.Stock}
+	// 库存核算与新预留共用同一条规则：先按本次时刻确认该备件已到期的承诺
+	// （不可逆，之后即使传入更早时刻也不再计入占用、可承诺数量不回落），
+	// 再计算实物剩余、有效占用与可承诺数量。
+	basis := s.accountPartStockLocked(part, now)
+	view := &PartStatus{
+		PartID:            partID,
+		PhysicalRemaining: basis.PhysicalRemaining,
+		ActiveOccupied:    basis.ActiveOccupied,
+		Committable:       basis.Committable,
+	}
 	for _, c := range s.commitments {
 		if c.PartID != partID {
 			continue
 		}
 		view.Details = append(view.Details, toDetailLocked(c, now))
-		// 占用只看持久状态：取消或已确认到期的承诺不占数量，不随本次时刻回退。
-		if !c.Canceled && !c.Expired {
-			view.ActiveOccupied += c.Quantity - c.Used
-		}
 	}
 	sort.Slice(view.Details, func(i, j int) bool {
 		return view.Details[i].CommitmentID < view.Details[j].CommitmentID
 	})
-	view.Committable = view.PhysicalRemaining - view.ActiveOccupied
 	return view, nil
 }
