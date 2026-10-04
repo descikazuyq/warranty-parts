@@ -5,12 +5,17 @@ import (
 	"time"
 )
 
-// activeOccupiedLocked 返回某备件当前仍有效承诺的未用总量。
-// 已取消或已确认到期的承诺不计入占用；到期一经确认不可逆，与本次传入的
-// 当前时刻无关，因此这里不再接收当前时刻，时刻相关的到期确认由调用方
-// 在核算前对本次涉及的承诺显式完成。
-func (s *Store) activeOccupiedLocked(partID string) int {
-	total := 0
+// stockAccountLocked 按统一的库存规则核算指定备件当前的账目：实物剩余只扣除
+// 成功使用的数量（即备件当前库存），有效占用是该备件所有未取消、未确认到期
+// 承诺的未用总量，可承诺数量等于实物剩余减去有效占用。已取消或已确认到期的
+// 承诺不计入占用；到期一经确认不可逆，与本次传入的当前时刻无关，因此这里
+// 不接收当前时刻，时刻相关的到期确认由调用方在核算前对本次涉及的承诺显式
+// 完成。新预留的库存核算与按备件的库存查询共用这一份账目，同一条库存规则
+// 不再分别维护。
+//
+// 调用方须已确认备件存在。
+func (s *Store) stockAccountLocked(partID string) StockBasis {
+	account := StockBasis{PhysicalRemaining: s.parts[partID].Stock}
 	for _, c := range s.commitments {
 		if c.PartID != partID {
 			continue
@@ -18,9 +23,10 @@ func (s *Store) activeOccupiedLocked(partID string) int {
 		if c.Canceled || c.Expired {
 			continue
 		}
-		total += c.Quantity - c.Used
+		account.ActiveOccupied += c.Unused()
 	}
-	return total
+	account.Committable = account.PhysicalRemaining - account.ActiveOccupied
+	return account
 }
 
 // Reserve 为请求预留一种备件，数量为正整数，到期时刻必须晚于本次提交的当前时刻。
@@ -100,8 +106,7 @@ func (s *Store) Reserve(commitID, requestID, partID string, quantity int, expiry
 	if !ok {
 		return Commitment{}, fmt.Errorf("%w: request %q", ErrNotFound, requestID)
 	}
-	part, ok := s.parts[partID]
-	if !ok {
+	if _, ok := s.parts[partID]; !ok {
 		record(false, HistoryErrorPartNotFound, nil, nil)
 		return Commitment{}, fmt.Errorf("%w: part %q", ErrNotFound, partID)
 	}
@@ -117,20 +122,17 @@ func (s *Store) Reserve(commitID, requestID, partID string, quantity int, expiry
 	// 非法或缺失引用调用不确认任何承诺。
 	s.confirmPartExpiriesLocked(partID, now)
 
-	// 库存依据：本次提交处理前的实物剩余、有效占用与可承诺数量。
-	stockBasis := &StockBasis{
-		PhysicalRemaining: part.Stock,
-		ActiveOccupied:    s.activeOccupiedLocked(partID),
-	}
-	stockBasis.Committable = stockBasis.PhysicalRemaining - stockBasis.ActiveOccupied
+	// 库存依据：本次提交处理前的实物剩余、有效占用与可承诺数量，与库存
+	// 查询共用同一份核算；在新增承诺落库之前取快照，本次新增占用不计入。
+	stockBasis := s.stockAccountLocked(partID)
 
 	if !elig.Eligible {
-		record(false, HistoryErrorIneligible, elig, stockBasis)
+		record(false, HistoryErrorIneligible, elig, &stockBasis)
 		return Commitment{}, fmt.Errorf("%w: %v", ErrIneligible, elig.Reasons)
 	}
 
 	if quantity > stockBasis.Committable {
-		record(false, HistoryErrorInsufficientStock, elig, stockBasis)
+		record(false, HistoryErrorInsufficientStock, elig, &stockBasis)
 		return Commitment{}, fmt.Errorf("%w: need %d, committable %d", ErrInsufficientStock, quantity, stockBasis.Committable)
 	}
 
@@ -146,7 +148,7 @@ func (s *Store) Reserve(commitID, requestID, partID string, quantity int, expiry
 	// 会改变原样重试取回的值。
 	s.commitments[commitID] = c
 	s.firstResults[commitID] = *c
-	record(true, "", elig, stockBasis)
+	record(true, "", elig, &stockBasis)
 	return *c, nil
 }
 
