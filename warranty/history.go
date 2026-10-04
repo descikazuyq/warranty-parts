@@ -86,22 +86,14 @@ func (s *Store) appendHistoryLocked(requestID string, rec HistoryRecord) {
 	s.history[requestID] = append(s.history[requestID], rec)
 }
 
-// recordInvalidParamLocked 在已持锁的情况下，仅当请求已知时记录一次参数无效失败。
-func (s *Store) recordInvalidParamLocked(requestID, commitID, partID string, quantity int, expiry, now time.Time) {
-	if requestID == "" {
-		return
-	}
+// recordReserveLocked 在已持锁的情况下，仅当请求已知时为一次预留提交追加一条
+// 处理记录。请求编号为空或尚未登记时不创建请求和历史；记录内容（成功标记或
+// 失败类别、资格与库存依据快照）由调用方按当次处理结果给定，这里不补全或改写。
+func (s *Store) recordReserveLocked(requestID string, rec HistoryRecord) {
 	if _, ok := s.requests[requestID]; !ok {
 		return
 	}
-	s.appendHistoryLocked(requestID, HistoryRecord{
-		CommitID: commitID,
-		PartID:   partID,
-		Quantity: quantity,
-		Expiry:   expiry,
-		Now:      now,
-		Error:    HistoryErrorInvalidParam,
-	})
+	s.appendHistoryLocked(requestID, rec)
 }
 
 // RequestHistory 返回指定请求的预留处理历史，按处理次序排列，序号严格递增。
