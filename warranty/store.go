@@ -160,12 +160,20 @@ func NewStore() *Store {
 }
 
 // RegisterProduct 登记产品：购买时刻、保修天数和除外故障代码。
-// 编号重复时返回 ErrDuplicateID 且保留原记录。保修天数必须为正整数，且自购买
-// 时刻起完整天数（每天二十四小时）的截止时刻必须落在时间类型的可表示范围内，
-// 否则返回 ErrInvalidParam，不保存产品记录。
+// 编号重复时返回 ErrDuplicateID 且保留原记录；已存在的非空编号优先于其他
+// 参数校验，即使新提交的保修天数、截止时刻或除外清单不合法也报编号重复，
+// 原记录不被覆盖、清空或部分替换。保修天数必须为正整数，且自购买时刻起完整
+// 天数（每天二十四小时）的截止时刻必须落在时间类型的可表示范围内，否则返回
+// ErrInvalidParam，不保存产品记录。
 func (s *Store) RegisterProduct(id string, purchaseTime time.Time, warrantyDays int, excludedCodes []string) error {
 	if id == "" {
 		return fmt.Errorf("%w: product id must not be empty", ErrInvalidParam)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// 编号已存在时一律报重复并保留原记录，不再校验新提交的条款。
+	if _, ok := s.products[id]; ok {
+		return fmt.Errorf("%w: product %q", ErrDuplicateID, id)
 	}
 	if warrantyDays <= 0 {
 		return fmt.Errorf("%w: warranty days must be a positive integer", ErrInvalidParam)
@@ -174,11 +182,6 @@ func (s *Store) RegisterProduct(id string, purchaseTime time.Time, warrantyDays 
 	// 之后以同一编号提交可表示的条款仍可正常登记。
 	if _, ok := warrantyExpiry(purchaseTime, warrantyDays); !ok {
 		return fmt.Errorf("%w: warranty expiry for %d days is not representable", ErrInvalidParam, warrantyDays)
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.products[id]; ok {
-		return fmt.Errorf("%w: product %q", ErrDuplicateID, id)
 	}
 	codes := make(map[string]struct{}, len(excludedCodes))
 	for _, c := range excludedCodes {
