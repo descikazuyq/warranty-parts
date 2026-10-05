@@ -87,22 +87,25 @@ func (s *Store) confirmExpiryLocked(c *Commitment, now time.Time) {
 	}
 }
 
-// confirmPartExpiriesLocked 确认指定备件下全部已到期但尚未确认的承诺。
-func (s *Store) confirmPartExpiriesLocked(partID string, now time.Time) {
+// confirmExpiriesLocked 按本次当前时刻确认满足条件的承诺到期：仅确认本次
+// 操作涉及的承诺，未取消、尚未确认且当前时刻已达到到期时刻时置位 Expired；
+// 该结果不可逆。已取消的承诺保持 canceled，不确认到期。
+func (s *Store) confirmExpiriesLocked(match func(*Commitment) bool, now time.Time) {
 	for _, c := range s.commitments {
-		if c.PartID == partID {
+		if match(c) {
 			s.confirmExpiryLocked(c, now)
 		}
 	}
 }
 
+// confirmPartExpiriesLocked 确认指定备件下全部已到期但尚未确认的承诺。
+func (s *Store) confirmPartExpiriesLocked(partID string, now time.Time) {
+	s.confirmExpiriesLocked(byPart(partID), now)
+}
+
 // confirmRequestExpiriesLocked 确认指定请求下全部已到期但尚未确认的承诺。
 func (s *Store) confirmRequestExpiriesLocked(requestID string, now time.Time) {
-	for _, c := range s.commitments {
-		if c.RequestID == requestID {
-			s.confirmExpiryLocked(c, now)
-		}
-	}
+	s.confirmExpiriesLocked(byRequest(requestID), now)
 }
 
 // Status 返回承诺的当前状态。

@@ -48,6 +48,18 @@ type RequestView struct {
 	Commitments []CommitmentDetail
 }
 
+// byPart 返回按备件编号筛选承诺的条件：只命中归属该备件的承诺，
+// 不混入其他备件的记录。
+func byPart(partID string) func(*Commitment) bool {
+	return func(c *Commitment) bool { return c.PartID == partID }
+}
+
+// byRequest 返回按请求编号筛选承诺的条件：只命中归属该请求的承诺，
+// 不混入其他请求的记录。
+func byRequest(requestID string) func(*Commitment) bool {
+	return func(c *Commitment) bool { return c.RequestID == requestID }
+}
+
 // toDetailLocked 生成承诺在指定时刻的明细。
 func toDetailLocked(c *Commitment, now time.Time) CommitmentDetail {
 	return CommitmentDetail{
@@ -60,6 +72,24 @@ func toDetailLocked(c *Commitment, now time.Time) CommitmentDetail {
 		Expiry:            c.Expiry,
 		Status:            c.Status(now),
 	}
+}
+
+// commitmentDetailsLocked 按统一规则整理满足条件的承诺明细：每条命中承诺
+// 生成查询时刻的明细视图，已取消、已到期和已全部使用的记录照常保留，结果
+// 按承诺编号升序排列。按请求查询与按备件查询共用这一份整理规则。返回的
+// 切片与明细都是新建副本，调用方修改不影响仓库记录和其他已返回的结果。
+func (s *Store) commitmentDetailsLocked(match func(*Commitment) bool, now time.Time) []CommitmentDetail {
+	var details []CommitmentDetail
+	for _, c := range s.commitments {
+		if !match(c) {
+			continue
+		}
+		details = append(details, toDetailLocked(c, now))
+	}
+	sort.Slice(details, func(i, j int) bool {
+		return details[i].CommitmentID < details[j].CommitmentID
+	})
+	return details
 }
 
 // RequestView 返回指定请求在当前时刻的资格依据、拒绝原因和关联承诺。
@@ -85,17 +115,10 @@ func (s *Store) RequestView(requestID string, now time.Time) (*RequestView, erro
 	if err != nil {
 		return nil, err
 	}
-	view := &RequestView{Eligibility: elig}
-	for _, c := range s.commitments {
-		if c.RequestID != requestID {
-			continue
-		}
-		view.Commitments = append(view.Commitments, toDetailLocked(c, now))
-	}
-	sort.Slice(view.Commitments, func(i, j int) bool {
-		return view.Commitments[i].CommitmentID < view.Commitments[j].CommitmentID
-	})
-	return view, nil
+	return &RequestView{
+		Eligibility: elig,
+		Commitments: s.commitmentDetailsLocked(byRequest(requestID), now),
+	}, nil
 }
 
 // PartStatus 返回指定备件在当前时刻的实物剩余、有效占用、可承诺数量和占用明细。
@@ -118,20 +141,11 @@ func (s *Store) PartStatus(partID string, now time.Time) (*PartStatus, error) {
 	// 实物剩余、有效占用与可承诺数量与新预留的库存核算共用同一条规则：
 	// 占用只看持久状态，取消或已确认到期的承诺不占数量，不随本次时刻回退。
 	account := s.stockAccountLocked(partID)
-	view := &PartStatus{
+	return &PartStatus{
 		PartID:            partID,
 		PhysicalRemaining: account.PhysicalRemaining,
 		ActiveOccupied:    account.ActiveOccupied,
 		Committable:       account.Committable,
-	}
-	for _, c := range s.commitments {
-		if c.PartID != partID {
-			continue
-		}
-		view.Details = append(view.Details, toDetailLocked(c, now))
-	}
-	sort.Slice(view.Details, func(i, j int) bool {
-		return view.Details[i].CommitmentID < view.Details[j].CommitmentID
-	})
-	return view, nil
+		Details:           s.commitmentDetailsLocked(byPart(partID), now),
+	}, nil
 }
