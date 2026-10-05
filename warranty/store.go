@@ -200,18 +200,23 @@ func (s *Store) RegisterProduct(id string, purchaseTime time.Time, warrantyDays 
 }
 
 // RegisterPart 登记备件及其非负整数初始库存。
-// 编号重复时返回 ErrDuplicateID 且保留原记录。
+// 编号重复时返回 ErrDuplicateID 且保留原记录：已存在的非空编号优先于本次
+// 库存校验，即使再次提交的初始库存为负数或零，也一律报编号重复，重复登记
+// 既不是补货也不会重置剩余库存，原备件的实物库存与承诺占用均保持不变。
+// 未登记过的非空编号首次提交时，初始库存必须是非负整数，否则返回
+// ErrInvalidParam，不保存备件记录、不占用编号；零库存也是有效登记。
 func (s *Store) RegisterPart(id string, initialStock int) error {
 	if id == "" {
 		return fmt.Errorf("%w: part id must not be empty", ErrInvalidParam)
 	}
-	if initialStock < 0 {
-		return fmt.Errorf("%w: initial stock must be a non-negative integer", ErrInvalidParam)
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// 编号已存在时一律报重复并保留原记录，不再校验本次提交的初始库存。
 	if _, ok := s.parts[id]; ok {
 		return fmt.Errorf("%w: part %q", ErrDuplicateID, id)
+	}
+	if initialStock < 0 {
+		return fmt.Errorf("%w: initial stock must be a non-negative integer", ErrInvalidParam)
 	}
 	s.parts[id] = &Part{ID: id, Stock: initialStock}
 	return nil
