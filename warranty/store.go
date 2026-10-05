@@ -218,18 +218,24 @@ func (s *Store) RegisterPart(id string, initialStock int) error {
 }
 
 // SubmitRequest 提交保修请求，指定产品和故障代码。
-// 编号重复时返回 ErrDuplicateID 且保留原记录。
+// 编号重复时返回 ErrDuplicateID 且保留原记录：已存在的非空编号优先于本次
+// 参数校验，即使再次提交换了产品编号，或把故障代码改成空串等不合法内容，
+// 也一律报编号重复，原请求的产品编号与故障代码不被覆盖、清空或部分替换，
+// 资格依据、关联承诺与预留历史都继续按第一次成功提交的资料执行。
+// 空请求编号或空故障代码的首次提交返回 ErrInvalidParam，不保存请求记录；
+// 提交时不校验产品是否已登记，产品缺失留待资格查询与预留时报告。
 func (s *Store) SubmitRequest(id, productID, faultCode string) error {
 	if id == "" {
 		return fmt.Errorf("%w: request id must not be empty", ErrInvalidParam)
 	}
-	if faultCode == "" {
-		return fmt.Errorf("%w: fault code must not be empty", ErrInvalidParam)
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// 编号已存在时一律报重复并保留原记录，不再校验新提交的产品与故障代码。
 	if _, ok := s.requests[id]; ok {
 		return fmt.Errorf("%w: request %q", ErrDuplicateID, id)
+	}
+	if faultCode == "" {
+		return fmt.Errorf("%w: fault code must not be empty", ErrInvalidParam)
 	}
 	s.requests[id] = &Request{ID: id, ProductID: productID, FaultCode: faultCode}
 	return nil
