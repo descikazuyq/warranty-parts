@@ -41,6 +41,114 @@ ps, _ := s.PartStatus("PART-A", now)
 h, _ := s.RequestHistory("REQ-1")
 ```
 
+## 过保后继续使用既有承诺
+
+保修资格的期限与承诺预留的期限是两个互相独立的时刻，分别约束不同环节，
+资格变化不会追溯已经预留成功的备件：
+
+- **保修截止时刻只决定“新的首次预留”能否成功。** 每次首次预留都按当次调用
+  传入的当前时刻重新判断资格：在保修截止时刻之前且未命中除外代码才合格。
+  产品过保之后用**新的承诺编号**预留，即使备件仍有余量，也返回
+  `ErrIneligible`，不创建承诺、不增加任何占用。
+- **承诺自身的到期时刻约束“已经预留成功的备件”的后续使用。** 成功预留之后的
+  分批使用（`Use`）只检查这笔承诺自己的到期时刻、取消状态和未用数量是否足够，
+  不再回看产品保修资格。因此产品后来过保，既不会自动取消承诺，也不会提前释放
+  未用占用：在承诺到期或被取消之前，未用数量一直计入有效占用，可承诺数量相应
+  减少；拿着**旧承诺编号**领取备件是另一种操作，仍正常扣减未用数量与实物库存。
+- **承诺到期只释放未用占用，不收回已领实物。** 当前时刻达到承诺到期时刻后，
+  新的使用一律返回 `ErrCommitmentClosed`，不新增使用记录、不再扣减实物；未用
+  数量永久移出有效占用、重新计入可承诺数量。已经成功领走的实物早已扣减，不会
+  因到期回到库存。承诺明细（原数量、已用、未用、到期时刻）继续保留，状态显示
+  expired（若曾取消则显示 canceled）。
+
+下面是可直接采用的完整示例：固定购买时刻、三十天保修期、十件初始库存，故障
+代码不在除外清单中；保修截止前为同一请求成功预留四件，承诺到期时刻安排在保修
+截止时刻之后，依次跨过保修截止与承诺到期两个时刻。
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/descikazuyq/warranty-parts/warranty"
+)
+
+func main() {
+	s := warranty.NewStore()
+	must := func(err error) {
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	// 固定时刻：2026-01-01 购买，保修期三十天，保修截止为 2026-01-31 00:00 UTC。
+	purchase := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	warrantyEnd := purchase.AddDate(0, 0, 30)  // 2026-01-31 00:00 UTC
+	reserveAt := purchase.AddDate(0, 0, 20)   // 2026-01-21 00:00 UTC，保修截止之前
+	commitExpiry := purchase.AddDate(0, 0, 40) // 2026-02-10 00:00 UTC，保修截止之后
+
+	// 登记：故障代码 NOISE 不在除外清单中；备件初始库存十件。
+	must(s.RegisterProduct("P1", purchase, 30, []string{"BROKEN_SEAL"}))
+	must(s.RegisterPart("PART-A", 10))
+	must(s.SubmitRequest("REQ-1", "P1", "NOISE"))
+
+	// 保修截止前成功预留四件，承诺到期晚于保修截止。
+	_, err := s.Reserve("COMMIT-1", "REQ-1", "PART-A", 4, commitExpiry, reserveAt)
+	must(err)
+
+	// 恰好到达保修截止时刻：资格不合格，拒绝原因只有过保一项。
+	rv, err := s.RequestView("REQ-1", warrantyEnd)
+	must(err)
+	fmt.Println(rv.Eligibility.Eligible)       // false
+	fmt.Printf("%v\n", rv.Eligibility.Reasons) // [warranty_expired]
+
+	// 原承诺不受影响：实物十件、有效占用四件、可承诺六件。
+	ps, err := s.PartStatus("PART-A", warrantyEnd)
+	must(err)
+	fmt.Println(ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable) // 10 4 6
+
+	// 用新承诺编号再预留：按当次时刻判资格，返回 ErrIneligible，不增加占用。
+	_, err = s.Reserve("COMMIT-2", "REQ-1", "PART-A", 2, commitExpiry, warrantyEnd)
+	fmt.Println(errors.Is(err, warranty.ErrIneligible)) // true
+	ps, err = s.PartStatus("PART-A", warrantyEnd)
+	must(err)
+	fmt.Println(ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable) // 10 4 6
+
+	// 使用旧承诺是另一种操作：用新的使用编号领取两件，成功（不回看保修资格）。
+	_, err = s.Use("USE-1", "COMMIT-1", 2, warrantyEnd)
+	must(err)
+
+	// 承诺已用两件、未用两件；实物剩八件、有效占用两件、可承诺仍为六件。
+	rv, err = s.RequestView("REQ-1", warrantyEnd)
+	must(err)
+	d := rv.Commitments[0]
+	fmt.Println(d.OriginalQuantity, d.UsedQuantity, d.RemainingQuantity, d.Status) // 4 2 2 active
+	ps, err = s.PartStatus("PART-A", warrantyEnd)
+	must(err)
+	fmt.Println(ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable) // 8 2 6
+
+	// 到达承诺自身的到期时刻：用尚未成功过的使用编号领取一件，被关闭拒绝。
+	_, err = s.Use("USE-2", "COMMIT-1", 1, commitExpiry)
+	fmt.Println(errors.Is(err, warranty.ErrCommitmentClosed)) // true
+
+	// 不新增使用记录、不再扣实物；未用两件释放占用，备件仍剩八件且都可承诺。
+	ps, err = s.PartStatus("PART-A", commitExpiry)
+	must(err)
+	d = ps.Details[0]
+	fmt.Println(ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable)            // 8 0 8
+	fmt.Println(d.OriginalQuantity, d.UsedQuantity, d.RemainingQuantity, d.Status) // 4 2 2 expired
+}
+```
+
+三个时刻的账目（实物剩余 / 有效占用 / 可承诺）依次是：保修截止时刻
+`10 / 4 / 6`，新承诺 `COMMIT-2` 因过保被拒后保持不变；用 `USE-1` 领取两件后
+变为 `8 / 2 / 6`，承诺明细为 `4 / 2 / 2 active`；到达承诺到期时刻，`USE-2`
+返回 `ErrCommitmentClosed`，账目变为 `8 / 0 / 8`，明细保留 `4 / 2 / 2 expired`。
+到期释放的只是未用的两件占用，已经领走的两件实物不会因此回到库存。
+
 ## 规则要点
 
 - 产品、备件、请求编号重复登记一律报错（`ErrDuplicateID`）且保留原记录。
