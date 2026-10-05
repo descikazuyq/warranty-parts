@@ -62,6 +62,24 @@ func toDetailLocked(c *Commitment, now time.Time) CommitmentDetail {
 	}
 }
 
+// commitmentDetailsLocked 是两种查询入口共用的承诺明细处理规则：收集全部满足
+// match 的承诺（含已取消、已到期、已全部使用的记录），按本次时刻生成明细，
+// 并按承诺编号升序排序。按请求查询与按备件查询只传入不同的归属条件，过滤、
+// 明细生成与排序规则不再分别维护。返回的明细是独立副本，与仓库记录互不影响。
+func (s *Store) commitmentDetailsLocked(match func(*Commitment) bool, now time.Time) []CommitmentDetail {
+	var details []CommitmentDetail
+	for _, c := range s.commitments {
+		if !match(c) {
+			continue
+		}
+		details = append(details, toDetailLocked(c, now))
+	}
+	sort.Slice(details, func(i, j int) bool {
+		return details[i].CommitmentID < details[j].CommitmentID
+	})
+	return details
+}
+
 // RequestView 返回指定请求在当前时刻的资格依据、拒绝原因和关联承诺。
 // 查询会按本次当前时刻确认该请求下已到期的承诺：到期一经确认不可逆，之后
 // 即使传入更早时刻，这些承诺也始终显示 expired、不再计入有效占用；到期时刻
@@ -86,15 +104,9 @@ func (s *Store) RequestView(requestID string, now time.Time) (*RequestView, erro
 		return nil, err
 	}
 	view := &RequestView{Eligibility: elig}
-	for _, c := range s.commitments {
-		if c.RequestID != requestID {
-			continue
-		}
-		view.Commitments = append(view.Commitments, toDetailLocked(c, now))
-	}
-	sort.Slice(view.Commitments, func(i, j int) bool {
-		return view.Commitments[i].CommitmentID < view.Commitments[j].CommitmentID
-	})
+	view.Commitments = s.commitmentDetailsLocked(func(c *Commitment) bool {
+		return c.RequestID == requestID
+	}, now)
 	return view, nil
 }
 
@@ -124,14 +136,8 @@ func (s *Store) PartStatus(partID string, now time.Time) (*PartStatus, error) {
 		ActiveOccupied:    account.ActiveOccupied,
 		Committable:       account.Committable,
 	}
-	for _, c := range s.commitments {
-		if c.PartID != partID {
-			continue
-		}
-		view.Details = append(view.Details, toDetailLocked(c, now))
-	}
-	sort.Slice(view.Details, func(i, j int) bool {
-		return view.Details[i].CommitmentID < view.Details[j].CommitmentID
-	})
+	view.Details = s.commitmentDetailsLocked(func(c *Commitment) bool {
+		return c.PartID == partID
+	}, now)
 	return view, nil
 }

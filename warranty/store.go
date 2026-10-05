@@ -87,22 +87,24 @@ func (s *Store) confirmExpiryLocked(c *Commitment, now time.Time) {
 	}
 }
 
-// confirmPartExpiriesLocked 确认指定备件下全部已到期但尚未确认的承诺。
-func (s *Store) confirmPartExpiriesLocked(partID string, now time.Time) {
+// confirmExpiriesLocked 确认全部满足 match 的承诺中已到期但尚未确认的记录。
+// 只确认本次操作涉及的承诺，不触碰其他对象的记录。
+func (s *Store) confirmExpiriesLocked(match func(*Commitment) bool, now time.Time) {
 	for _, c := range s.commitments {
-		if c.PartID == partID {
+		if match(c) {
 			s.confirmExpiryLocked(c, now)
 		}
 	}
 }
 
+// confirmPartExpiriesLocked 确认指定备件下全部已到期但尚未确认的承诺。
+func (s *Store) confirmPartExpiriesLocked(partID string, now time.Time) {
+	s.confirmExpiriesLocked(func(c *Commitment) bool { return c.PartID == partID }, now)
+}
+
 // confirmRequestExpiriesLocked 确认指定请求下全部已到期但尚未确认的承诺。
 func (s *Store) confirmRequestExpiriesLocked(requestID string, now time.Time) {
-	for _, c := range s.commitments {
-		if c.RequestID == requestID {
-			s.confirmExpiryLocked(c, now)
-		}
-	}
+	s.confirmExpiriesLocked(func(c *Commitment) bool { return c.RequestID == requestID }, now)
 }
 
 // Status 返回承诺的当前状态。
