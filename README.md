@@ -41,6 +41,137 @@ ps, _ := s.PartStatus("PART-A", now)
 h, _ := s.RequestHistory("REQ-1")
 ```
 
+## 过保后使用既有备件承诺
+
+保修资格与承诺有效是两个互相独立的期限，作用阶段不同，不能互相替代：
+
+- **保修截止时刻只约束“新承诺的首次预留”**。每次 `Reserve` 都按当次调用传入的
+  当前时刻重新判断资格（是否过保、故障代码是否命中除外清单）；资格判断只在首次
+  预留成功所需的那一次起作用。
+- **承诺一旦预留成功，后续使用只受承诺自己约束**：本次当前时刻是否达到承诺自身
+  的到期时刻、承诺是否已被取消、本次数量是否超过承诺的未用数量。使用旧承诺不会
+  重新判断产品保修资格。
+- 产品后来过保，既不会自动取消已经成立的承诺，也不会提前释放其未用占用：过保后
+  用**新承诺编号**发起的首次预留一律返回 `ErrIneligible` 且不增加占用；而对旧承诺
+  的 `Use` 是另一种操作，仍按旧承诺自身的到期时刻、取消状态和未用数量执行。
+- 承诺到期（或取消）释放的只是**未用数量对应的占用**，可承诺数量相应回升；已经
+  通过 `Use` 领走的实物不会因此退回库存。承诺明细仍保留原定数量、已用数量和未用
+  数量，状态显示为 `expired`（取消则显示 `canceled`）。
+
+下面的完整示例采用固定购买时刻、三十天保修期和十件初始库存，故障代码不在除外
+清单中：保修截止前成功预留四件，承诺到期安排在保修截止之后；随后依次走到保修
+截止时刻与承诺自身的到期时刻。
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/descikazuyq/warranty-parts/warranty"
+)
+
+func main() {
+	loc := time.UTC
+	purchase := time.Date(2026, 1, 1, 0, 0, 0, 0, loc)
+	warrantyEnd := time.Date(2026, 1, 31, 0, 0, 0, 0, loc) // 购买时刻 + 30×24h
+	reserveAt := time.Date(2026, 1, 20, 12, 0, 0, 0, loc)
+	commitmentExpiry := time.Date(2026, 2, 10, 0, 0, 0, 0, loc) // 晚于保修截止
+
+	s := warranty.NewStore()
+	// 登记：30 天保修，除外清单不含本次故障代码 NOISE；备件初始库存 10 件。
+	must(s.RegisterProduct("P1", purchase, 30, []string{"BROKEN_SEAL"}))
+	must(s.RegisterPart("PART-A", 10))
+	must(s.SubmitRequest("REQ-1", "P1", "NOISE"))
+
+	// 保修截止前成功预留 4 件，承诺到期安排在保修截止之后。
+	c, err := s.Reserve("COMMIT-1", "REQ-1", "PART-A", 4, commitmentExpiry, reserveAt)
+	must(err)
+	fmt.Printf("reserved: id=%s qty=%d unused=%d\n", c.ID, c.Quantity, c.Unused())
+
+	// 恰好到达保修截止时刻：资格查询显示不合格，拒绝原因只有“过保”。
+	elig, err := s.Evaluate("REQ-1", warrantyEnd)
+	must(err)
+	fmt.Printf("eligible at warranty end: %v reasons=%v\n", elig.Eligible, elig.Reasons)
+
+	// 原承诺尚未到自己的到期时刻，仍有效：实物 10、有效占用 4、可承诺 6。
+	ps, err := s.PartStatus("PART-A", warrantyEnd)
+	must(err)
+	fmt.Printf("part at warranty end: physical=%d occupied=%d committable=%d\n",
+		ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable)
+
+	// 用新承诺编号再预留：产品已过保，返回 ErrIneligible，不增加占用。
+	_, err = s.Reserve("COMMIT-2", "REQ-1", "PART-A", 1, commitmentExpiry, warrantyEnd)
+	fmt.Println("reserve after warranty end:", err)
+	fmt.Println("reserve matches ErrIneligible:", errors.Is(err, warranty.ErrIneligible))
+	ps, err = s.PartStatus("PART-A", warrantyEnd)
+	must(err)
+	fmt.Printf("part after rejected reserve: physical=%d occupied=%d committable=%d\n",
+		ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable)
+
+	// 使用旧承诺是另一种操作：只看承诺自己的到期时刻、取消状态和未用数量，
+	// 不再判断保修资格。在保修截止时刻用新的使用编号领取 2 件，成功。
+	u, err := s.Use("USE-1", "COMMIT-1", 2, warrantyEnd)
+	must(err)
+	fmt.Printf("used: id=%s commitment=%s qty=%d\n", u.ID, u.CommitmentID, u.Quantity)
+
+	// 承诺已用 2 件、未用 2 件，状态仍为 active。
+	rv, err := s.RequestView("REQ-1", warrantyEnd)
+	must(err)
+	d := rv.Commitments[0]
+	fmt.Printf("commitment after use: qty=%d used=%d unused=%d status=%s\n",
+		d.OriginalQuantity, d.UsedQuantity, d.RemainingQuantity, d.Status)
+	// 实物剩余 8、有效占用 2、可承诺仍为 6（8−2）。
+	ps, err = s.PartStatus("PART-A", warrantyEnd)
+	must(err)
+	fmt.Printf("part after use: physical=%d occupied=%d committable=%d\n",
+		ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable)
+
+	// 到达承诺自身的到期时刻：用尚未成功过的使用编号再领 1 件。
+	_, err = s.Use("USE-2", "COMMIT-1", 1, commitmentExpiry)
+	fmt.Println("use at commitment expiry:", err)
+	fmt.Println("use matches ErrCommitmentClosed:", errors.Is(err, warranty.ErrCommitmentClosed))
+
+	// 不新增使用记录：明细仍是原数量 4、已用 2、未用 2，状态变为 expired。
+	rv, err = s.RequestView("REQ-1", commitmentExpiry)
+	must(err)
+	d = rv.Commitments[0]
+	fmt.Printf("commitment after expiry: qty=%d used=%d unused=%d status=%s\n",
+		d.OriginalQuantity, d.UsedQuantity, d.RemainingQuantity, d.Status)
+	// 未用的 2 件释放占用：实物仍剩 8 件且全部可承诺；已领走的 2 件不回库存。
+	ps, err = s.PartStatus("PART-A", commitmentExpiry)
+	must(err)
+	fmt.Printf("part after expiry: physical=%d occupied=%d committable=%d\n",
+		ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable)
+}
+
+func must(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+```
+
+输出：
+
+```text
+reserved: id=COMMIT-1 qty=4 unused=4
+eligible at warranty end: false reasons=[warranty_expired]
+part at warranty end: physical=10 occupied=4 committable=6
+reserve after warranty end: warranty: request is not eligible: [warranty_expired]
+reserve matches ErrIneligible: true
+part after rejected reserve: physical=10 occupied=4 committable=6
+used: id=USE-1 commitment=COMMIT-1 qty=2
+commitment after use: qty=4 used=2 unused=2 status=active
+part after use: physical=8 occupied=2 committable=6
+use at commitment expiry: warranty: commitment is no longer active: commitment "COMMIT-1" expired at 2026-02-10 00:00:00 +0000 UTC
+use matches ErrCommitmentClosed: true
+commitment after expiry: qty=4 used=2 unused=2 status=expired
+part after expiry: physical=8 occupied=0 committable=8
+```
+
 ## 规则要点
 
 - 产品、备件、请求编号重复登记一律报错（`ErrDuplicateID`）且保留原记录。
