@@ -819,6 +819,167 @@ false true [fault_code_excluded]
   `8 / 2 / 6`。这也说明到期确认来自这次合法预留本身，而非之前的查询或
   提前失败的提交。
 
+## 取回承诺记录后按时刻查看状态：只是显示，不等于仓库已释放占用
+
+`Commitment` 按承诺编号取回的是一条**记录副本**，对它调用 `Status(now)` 只是
+把这条记录按调用方给定的时刻换算成显示状态，全程不触碰仓库。因此要区分两件
+条件不同、后果也不同的事：
+
+- **显示已到期（`Status` 返回 expired）**：只要手中记录的取消标记、到期确认
+  标记或传入时刻满足条件就算出来——传入时刻达到到期时刻即显示 expired，已
+  取消的记录始终显示 canceled。这是纯本地的换算结果：不确认仓库中的承诺到期，
+  不释放未用占用，不改变任何账目，也不会写回手中的副本。
+- **仓库确认到期（释放占用）**：只在针对已知备件的库存查询（`PartStatus`）、
+  针对已知请求的承诺明细查询（`RequestView`）、新预留的库存核算（`Reserve`）
+  或针对已知承诺的新使用判断（`Use`）中，本次当前时刻达到承诺到期时刻时才
+  发生。一经确认不可逆：未用占用永久释放、重新计入可承诺数量，已领走的实物
+  不会回到库存，之后即使传入更早时刻查询也持续显示 expired。
+
+调用方按需选择：只想按某个时刻**查看手中记录**的显示状态，用 `Commitment`
+取回副本后调 `Status`，这不会影响仓库；要**核对当前库存与占用**（这本身会
+确认到期），用 `PartStatus` 或 `RequestView`。尤其注意：`Commitment` 返回的
+副本是取回时刻的快照，仓库后来确认了到期也不会回填到旧副本上——旧副本仍
+保留未确认的标记，按早于到期的时刻查看仍可显示 active，因此旧副本不能替代
+重新查询来判断仓库现状。释放只涉及**未用占用**：已经成功领取的实物早已扣减，
+不会因到期确认回到实物库存。另外，已取消记录的状态始终为 canceled（取消
+优先于到期，与传入时刻无关）；取回未知承诺编号时返回 `ErrNotFound`。
+
+下面是可直接采用的完整示例，全程使用同一个仓库实例与固定时刻，产品始终在保、
+故障代码未命中除外：登记十件备件，预留六件并在到期前领取两件；通过
+`Commitment` 取得承诺副本后，按恰好到期的时刻调用 `Status` 观察显示结果，
+再分别用到期前、到期时刻的库存查询对照账目变化，最后演示旧副本不随仓库
+更新、已取消记录的状态与未知编号的错误。
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/descikazuyq/warranty-parts/warranty"
+)
+
+func main() {
+	s := warranty.NewStore()
+	// must 用于预期成功的操作：遇到意外错误立即停止，不继续输出成功结果。
+	must := func(err error) {
+		if err != nil {
+			panic(err)
+		}
+	}
+	// expectErr 用于预期失败分支：错误必须恰好是目标原因，否则同样立即停止，
+	// 不把真正的意外错误当成“预期拒绝”略过。
+	expectErr := func(err error, target error) {
+		if !errors.Is(err, target) {
+			panic(fmt.Sprintf("want %v, got %v", target, err))
+		}
+	}
+
+	// 固定时刻：2026-01-01 购买，保修三百六十五天，示例全程产品在保、
+	// 故障代码 NOISE 不命中除外清单。
+	purchase := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	now := purchase.AddDate(0, 0, 10)    // 2026-01-11，到期前的操作时刻
+	expiry := purchase.AddDate(0, 0, 40) // 2026-02-10，承诺到期时刻
+
+	// 登记十件备件，为合格请求预留六件，并在到期前领取两件。
+	must(s.RegisterProduct("P1", purchase, 365, []string{"BROKEN_SEAL"}))
+	must(s.RegisterPart("PART-A", 10))
+	must(s.SubmitRequest("REQ-1", "P1", "NOISE"))
+	_, err := s.Reserve("COMMIT-1", "REQ-1", "PART-A", 6, expiry, now)
+	must(err)
+	_, err = s.Use("USE-1", "COMMIT-1", 2, now)
+	must(err)
+
+	// 通过 Commitment 取回承诺副本：原数量六件、已用两件、未用四件，
+	// 到期尚未被任何操作确认。
+	copy1, err := s.Commitment("COMMIT-1")
+	must(err)
+	fmt.Println(copy1.Quantity, copy1.Used, copy1.Unused(), copy1.Expired)
+
+	// 按恰好到期的时刻调用 Status：这只是对手中副本按给定时刻算出的显示
+	// 结果，显示 expired；它不确认仓库中的承诺到期，也不释放未用占用。
+	fmt.Println(copy1.Status(expiry))
+
+	// 副本与重新取回的记录中 Expired 仍为 false，数量保持原值。
+	rec, err := s.Commitment("COMMIT-1")
+	must(err)
+	fmt.Println(copy1.Expired, rec.Expired)
+	fmt.Println(rec.Quantity, rec.Used, rec.Unused())
+
+	// 按到期前的时刻查询库存：仍是实物八件、有效占用四件、可承诺四件，
+	// 先前的状态显示没有改变这些数量。
+	ps, err := s.PartStatus("PART-A", now)
+	must(err)
+	fmt.Println(ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable)
+
+	// 在到期时刻用 PartStatus 核对库存：这次查询确认了承诺到期，未用四件
+	// 的占用被释放；实物仍为八件（已领走的两件不会回来），八件都可承诺，
+	// 明细保留六件原数量、两件已用、四件未用的 expired 记录。
+	ps, err = s.PartStatus("PART-A", expiry)
+	must(err)
+	fmt.Println(ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable)
+	d := ps.Details[0]
+	fmt.Println(d.OriginalQuantity, d.UsedQuantity, d.RemainingQuantity, d.Status)
+
+	// 重新取回同一承诺：Expired 已为 true；到期确认不可逆，
+	// 按到期前的时刻查看也持续显示 expired。
+	rec, err = s.Commitment("COMMIT-1")
+	must(err)
+	fmt.Println(rec.Expired, rec.Status(now))
+
+	// 此前保存的副本不随这次查询更新：它仍保留未确认的标记，按早于到期的
+	// 时刻查看仍可显示 active——旧副本不能替代重新查询来判断仓库现状。
+	fmt.Println(copy1.Expired, copy1.Status(now))
+
+	// 未知承诺编号取回时返回 ErrNotFound。
+	_, err = s.Commitment("COMMIT-UNKNOWN")
+	expectErr(err, warranty.ErrNotFound)
+
+	// 已取消记录的状态始终为 canceled，与传入时刻无关（取消优先于到期）。
+	must(s.RegisterPart("PART-B", 1))
+	_, err = s.Reserve("COMMIT-2", "REQ-1", "PART-B", 1, expiry, now)
+	must(err)
+	_, err = s.Cancel("COMMIT-2", now)
+	must(err)
+	canceled, err := s.Commitment("COMMIT-2")
+	must(err)
+	fmt.Println(canceled.Status(now), canceled.Status(expiry))
+}
+```
+
+程序输出：
+
+```text
+6 2 4 false
+expired
+false false
+6 2 4
+8 4 4
+8 0 8
+6 2 4 expired
+true expired
+false active
+canceled canceled
+```
+
+结果对应说明（账目中的三项依次为实物剩余 / 有效占用 / 可承诺）：
+
+- 取回副本时承诺为 `6 / 2 / 4` 且 `Expired=false`：领取两件只扣实物，未用
+  四件仍是有效占用。对副本按恰好到期的时刻调 `Status` 显示 `expired`，但这
+  只是显示结果：副本与重新取回记录的 `Expired` 仍为 `false`，数量保持
+  `6 / 2 / 4`，按到期前时刻查库存仍是 `8 / 4 / 4`——状态显示没有确认到期，
+  也没有释放那四件占用。
+- 在到期时刻用 `PartStatus` 核对库存才确认到期：账目变为 `8 / 0 / 8`，明细
+  保留 `6 / 2 / 4 expired`。释放的只是未用的四件占用，已经领取的两件实物不
+  会回到库存，实物仍为八件。此后重新取回记录 `Expired=true`，按到期前的时刻
+  查看也持续显示 `expired`（确认不可逆）。
+- 先前保存的副本不随这次查询更新：`Expired` 仍为 `false`，按早于到期的时刻
+  查看仍显示 `active`。它是取回时刻的快照，不能替代重新查询来判断仓库现状。
+- 未知承诺编号 `COMMIT-UNKNOWN` 取回时返回 `ErrNotFound`；已取消的
+  `COMMIT-2` 无论按到期前还是到期时刻查看，状态始终为 `canceled`。
+
 ## 规则要点
 
 - 产品、备件、请求编号重复登记一律报错（`ErrDuplicateID`）且保留原记录。
