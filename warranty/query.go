@@ -80,6 +80,39 @@ func (s *Store) commitmentDetailsLocked(match func(*Commitment) bool, now time.T
 	return details
 }
 
+// CommitmentUsages 返回指定承诺已成功使用的明细列表，按使用编号的字符串升序排列。
+// 每条明细是现有使用记录的副本，含使用编号、承诺编号和本次数量；列表中数量之和
+// 即该承诺的已用数量。只收录绑定到这笔承诺的成功记录：同一请求或同一种备件下
+// 其他承诺的使用不混入；超量、编号冲突等失败提交不产生记录，也不会覆盖已有的
+// 成功记录。承诺全部使用、取消或到期（含已确认到期）后成功记录仍然保留，取消或
+// 到期释放的未用数量不计入本列表；查询已关闭的承诺同样成功返回。
+//
+// 查询是只读操作：不扣减实物库存、不释放占用、不按任何时刻确认到期，也不追加
+// 预留处理历史。空承诺编号返回 ErrInvalidParam；非空但不存在的承诺返回
+// ErrNotFound；承诺存在但尚无成功使用时返回空列表。返回的列表是独立副本，
+// 调用方修改或增删其中的内容不影响仓库记录与后续查询。
+func (s *Store) CommitmentUsages(commitID string) ([]Usage, error) {
+	if commitID == "" {
+		return nil, fmt.Errorf("%w: commit id must not be empty", ErrInvalidParam)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.commitments[commitID]; !ok {
+		return nil, fmt.Errorf("%w: commitment %q", ErrNotFound, commitID)
+	}
+	usages := make([]Usage, 0)
+	for _, u := range s.usages {
+		if u.CommitmentID == commitID {
+			usages = append(usages, *u)
+		}
+	}
+	sort.Slice(usages, func(i, j int) bool {
+		return usages[i].ID < usages[j].ID
+	})
+	return usages, nil
+}
+
 // RequestView 返回指定请求在当前时刻的资格依据、拒绝原因和关联承诺。
 // 查询会按本次当前时刻确认该请求下已到期的承诺：到期一经确认不可逆，之后
 // 即使传入更早时刻，这些承诺也始终显示 expired、不再计入有效占用；到期时刻
