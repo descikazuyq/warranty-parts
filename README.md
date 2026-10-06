@@ -280,12 +280,170 @@ func main() {
 返回 `ErrCommitmentClosed`，账目变为 `8 / 0 / 8`，明细保留 `4 / 2 / 2 expired`。
 到期释放的只是未用的两件占用，已经领走的两件实物不会因此回到库存。
 
+## 故障代码除外按完整字符串精确匹配
+
+除外清单在 `RegisterProduct` 时随产品资料登记；判断资格时，把请求提交的故障
+代码与清单条目做**完整字符串比较**，只有与其中某一条**逐字符完全相同**才算
+命中。匹配规则没有任何模糊空间：
+
+- **区分大小写**：`BROKEN_SEAL` 与 `broken_seal` 是两个不同的代码，小写写法
+  不命中大写条目。
+- **首尾空格属于代码内容**：`" BROKEN_SEAL "`（首尾各一个空格）与
+  `"BROKEN_SEAL"` 不相等、不命中；字符串中的每个字符都原样参与比较。
+- **不做任何规范化或部分匹配**：提交请求（`SubmitRequest`）与判断资格
+  （`Evaluate`、`RequestView`，以及 `Reserve` 内部的资格判断）都不会替调用方
+  转成大写、删掉首尾空格，也不做前缀、子串等部分匹配。调用方若需要统一的规范
+  形式，必须在提交前自行处理。
+- **空除外清单与清单里的空字符串是两回事**：传入 `nil` 或长度为零的切片表示
+  清单为空，不按任何故障代码拒保；清单中一旦包含空字符串条目，
+  `RegisterProduct` 立即返回 `ErrInvalidParam` 且不保存产品。请求侧同理：
+  `SubmitRequest` 的故障代码为空字符串时返回 `ErrInvalidParam`、不保存请求。
+- 另外要分清“**请求保存成功**”与“**符合保修资格**”：三张故障代码互不相同的
+  请求都可以保存成功，是否命中除外只在按当次时刻判断资格时才见分晓。
+
+下面是可直接采用的完整示例：同一个仓库实例中登记购买时刻已到、保修三十天、
+除外清单只有 `BROKEN_SEAL` 的产品，另登记十件备件；先演示空清单与空字符串
+条目的区别、空故障代码请求被拒，再提交故障代码分别为 `BROKEN_SEAL`、
+`broken_seal` 和首尾各带一个空格的 `BROKEN_SEAL` 的三张请求，于保修期内
+固定时刻查询资格，并用三个不同的承诺编号各预留一件。预期失败（命中除外导致的
+`ErrIneligible` 等）作为显式分支校验；其他操作一旦遇到意外错误就立即停止，
+不会继续输出后面的“成功结果”。
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/descikazuyq/warranty-parts/warranty"
+)
+
+func main() {
+	s := warranty.NewStore()
+	// must 用于预期成功的操作：遇到意外错误立即停止，不继续输出成功结果。
+	must := func(err error) {
+		if err != nil {
+			panic(err)
+		}
+	}
+	// expectErr 用于预期失败分支：错误必须恰好是目标原因，
+	// 否则同样立即停止，不把真正的意外错误当成“预期拒绝”略过。
+	expectErr := func(err error, target error) {
+		if !errors.Is(err, target) {
+			panic(fmt.Sprintf("want %v, got %v", target, err))
+		}
+	}
+
+	// 固定时刻：2026-01-01 购买，保修三十天；查询与预留都取保修期内的同一时刻。
+	purchase := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	now := purchase.AddDate(0, 0, 10)    // 2026-01-11 00:00 UTC，保修期内
+	expiry := purchase.AddDate(0, 0, 40) // 2026-02-10 00:00 UTC，晚于当前时刻
+
+	// 空除外清单（nil 与长度为零的切片等价）：没有任何除外条目，不按故障代码拒保。
+	must(s.RegisterProduct("P0", purchase, 30, nil))
+
+	// 清单里出现空字符串：参数不合法，首次登记返回 ErrInvalidParam，产品不保存。
+	err := s.RegisterProduct("PX", purchase, 30, []string{"BROKEN_SEAL", ""})
+	expectErr(err, warranty.ErrInvalidParam)
+	_, err = s.Product("PX")
+	expectErr(err, warranty.ErrNotFound) // 产品确实没有落库
+
+	// 正式登记：购买时刻已到、保修三十天，除外清单只有精确的 BROKEN_SEAL；备件十件。
+	must(s.RegisterProduct("P1", purchase, 30, []string{"BROKEN_SEAL"}))
+	must(s.RegisterPart("PART-A", 10))
+
+	// 故障代码为空字符串：提交即返回 ErrInvalidParam，请求不保存。
+	err = s.SubmitRequest("REQ-BAD", "P1", "")
+	expectErr(err, warranty.ErrInvalidParam)
+	_, err = s.Request("REQ-BAD")
+	expectErr(err, warranty.ErrNotFound)
+
+	// 三张请求的故障代码是三个不同的字符串，只有第一个与登记条目逐字符完全相等。
+	codes := []string{"BROKEN_SEAL", "broken_seal", " BROKEN_SEAL "}
+	reqIDs := []string{"REQ-1", "REQ-2", "REQ-3"}
+	for i, code := range codes {
+		must(s.SubmitRequest(reqIDs[i], "P1", code))
+	}
+
+	// 三张请求全部保存成功：保存只校验编号与非空故障代码，不判断资格。
+	// %q 给字符串加上引号，首尾空格在取回结果中清晰可见，三个输入不会看起来一样。
+	for _, id := range reqIDs {
+		r, err := s.Request(id)
+		must(err)
+		fmt.Printf("%s saved fault=%q\n", id, r.FaultCode)
+	}
+
+	// 保修期内固定时刻查资格：REQ-1 不合格、命中除外，拒绝原因只有
+	// fault_code_excluded；另外两张合格、未命中除外且没有拒绝原因。
+	for _, id := range reqIDs {
+		rv, err := s.RequestView(id, now)
+		must(err)
+		e := rv.Eligibility
+		fmt.Printf("%s fault=%q eligible=%v excluded=%v reasons=%v\n",
+			id, e.FaultCode, e.Eligible, e.Excluded, e.Reasons)
+	}
+
+	// 用三个不同的承诺编号为三张请求各预留一件同种备件，到期时刻都晚于当前时刻。
+	commitIDs := []string{"COMMIT-1", "COMMIT-2", "COMMIT-3"}
+	for i, id := range reqIDs {
+		_, err := s.Reserve(commitIDs[i], id, "PART-A", 1, expiry, now)
+		if i == 0 {
+			// 预期失败分支：精确命中除外代码，返回 ErrIneligible。
+			expectErr(err, warranty.ErrIneligible)
+			continue
+		}
+		must(err) // 另外两张保修期内且未命中除外，预留必须成功
+	}
+
+	// 被拒的编号没有产生承诺：失败不占用编号，也不占用库存。
+	_, err = s.Commitment("COMMIT-1")
+	expectErr(err, warranty.ErrNotFound)
+
+	// 预留不扣实物：实物仍为十件，两张成功承诺各占一件，可承诺为八件。
+	ps, err := s.PartStatus("PART-A", now)
+	must(err)
+	fmt.Println(ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable)
+}
+```
+
+程序输出（注意 `%q` 下第三个故障代码首尾的空格）：
+
+```text
+REQ-1 saved fault="BROKEN_SEAL"
+REQ-2 saved fault="broken_seal"
+REQ-3 saved fault=" BROKEN_SEAL "
+REQ-1 fault="BROKEN_SEAL" eligible=false excluded=true reasons=[fault_code_excluded]
+REQ-2 fault="broken_seal" eligible=true excluded=false reasons=[]
+REQ-3 fault=" BROKEN_SEAL " eligible=true excluded=false reasons=[]
+10 2 8
+```
+
+结果说明：
+
+- 三张请求都**保存成功**，取回的故障代码原样保留大小写与首尾空格；保存成功
+  本身不代表保修合格。
+- `REQ-1` 的原代码 `BROKEN_SEAL` 与除外条目逐字符相等：不合格、命中除外，
+  拒绝原因只有 `fault_code_excluded`；`COMMIT-1` 预留返回 `ErrIneligible`，
+  查承诺得到 `ErrNotFound`，没有承诺、没有库存占用。
+- `REQ-2`（小写）与 `REQ-3`（首尾带空格）都不命中：合格、`excluded=false`、
+  没有拒绝原因，`COMMIT-2`、`COMMIT-3` 各成功预留一件。
+- 最终备件账目为实物十件、有效占用两件、可承诺八件（`10 / 2 / 8`）：预留不扣
+  实物，库存只被两笔成功承诺各占用一件。
+- 空清单产品 `P0` 正常登记；含空字符串条目的 `PX` 返回 `ErrInvalidParam` 且
+  不落库；空故障代码请求 `REQ-BAD` 同样返回 `ErrInvalidParam`、不落库。
+
 ## 规则要点
 
 - 产品、备件、请求编号重复登记一律报错（`ErrDuplicateID`）且保留原记录。
 - 购买时刻不得晚于当前时刻；保修天数为正整数；保修期自购买时刻起按每天
   二十四小时计算，自保修截止时刻起算过保；命中除外代码必须拒绝；过保与除外
-  同时成立时拒绝原因会列出两项。
+  同时成立时拒绝原因会列出两项。除外匹配按登记时给出的完整字符串逐字符比较：
+  区分大小写，首尾空格也是代码内容，不转大写、不删空格、不做部分匹配；空除外
+  清单表示不按故障代码拒保，清单中包含空字符串则产品登记返回
+  `ErrInvalidParam`、不保存产品，故障代码为空字符串的请求同样返回
+  `ErrInvalidParam`、不保存请求。
 - 可承诺数量 = 剩余实物库存 − 所有有效承诺的未用数量；库存不足、未知请求或
   备件、不合格请求都不占用数量。
 - 到期释放是不可撤销的结果：在针对已知备件的库存查询、针对已知请求的承诺
