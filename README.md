@@ -280,6 +280,181 @@ func main() {
 返回 `ErrCommitmentClosed`，账目变为 `8 / 0 / 8`，明细保留 `4 / 2 / 2 expired`。
 到期释放的只是未用的两件占用，已经领走的两件实物不会因此回到库存。
 
+## 取消已部分使用的承诺
+
+取消一笔已经分批领取过的承诺时，要把四个数量分清楚：
+
+- **实物剩余**：初始库存扣除全部成功使用量，只随真实领取减少。
+- **有效占用**：所有未取消、未确认到期承诺的未用数量之和，是“为别人留着”的部分。
+- **可承诺数量**：实物剩余减去有效占用，是新预留还能使用的上限。
+- **单笔承诺的未用数量**：原数量减去该承诺自己的已用数量，是明细里保留的事实。
+
+`Cancel` 释放的是**预留占用**，不是实物：取消只把这笔承诺尚未使用的数量移出
+有效占用、重新计入可承诺数量，供其他请求预留；已经领走的实物早已扣减库存，
+取消不会让它退回。因此释放数量是取消前的**未用数量**（原数量 − 已用数量），
+而不是原定的全部数量。取消后的承诺在请求查询与备件查询中仍完整展示：原数量、
+已用数量、未用数量与到期时刻都保留，状态为 canceled——这笔未用数量只是保留
+的数量事实，不代表原承诺还能领取，也**不计入有效占用**，不能与仍有效承诺的
+未用数量相加当作当前占用。已取消的承诺不再接受新的使用（`ErrCommitmentClosed`），
+但取消前已成功使用的记录不受影响，原样重试仍按幂等规则取回旧记录。
+
+下面是可直接采用的完整示例，全程使用同一个仓库实例、固定的购买时刻和操作
+时刻：所有请求都在保修期内且未命中除外，所有承诺的到期时刻都晚于这些操作。
+登记十件同种备件，为两张不同请求分别预留六件和三件，从六件承诺中领取两件后
+取消该承诺，再让一张新请求把释放出来的可承诺数量全部预留，最后验证已取消
+承诺拒绝新使用、而已有成功使用的重试仍取回旧记录。
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/descikazuyq/warranty-parts/warranty"
+)
+
+func main() {
+	s := warranty.NewStore()
+	// must 用于预期成功的操作：遇到意外错误立即停止，不继续输出成功结果。
+	must := func(err error) {
+		if err != nil {
+			panic(err)
+		}
+	}
+	// expectErr 用于预期拒绝分支：错误必须恰好是目标原因，
+	// 否则同样立即停止，不把真正的意外错误当成“预期拒绝”略过。
+	expectErr := func(err, target error) {
+		if !errors.Is(err, target) {
+			panic(fmt.Sprintf("want %v, got %v", target, err))
+		}
+	}
+
+	// 固定时刻：2026-01-01 购买，保修三十天；所有操作都在保修期内的同一时刻，
+	// 所有承诺的到期时刻都晚于这些操作时刻。
+	purchase := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	now := purchase.AddDate(0, 0, 10)    // 2026-01-11 00:00 UTC，保修期内
+	expiry := purchase.AddDate(0, 0, 40) // 2026-02-10 00:00 UTC，晚于所有操作时刻
+
+	// 登记：故障代码 NOISE 不在除外清单中；备件初始库存十件。
+	must(s.RegisterProduct("P1", purchase, 30, []string{"BROKEN_SEAL"}))
+	must(s.RegisterPart("PART-A", 10))
+
+	// 两张不同的请求，故障代码都未命中除外。
+	must(s.SubmitRequest("REQ-1", "P1", "NOISE"))
+	must(s.SubmitRequest("REQ-2", "P1", "NOISE"))
+
+	// 为 REQ-1 预留六件、为 REQ-2 预留三件，到期时刻相同且晚于操作时刻。
+	_, err := s.Reserve("COMMIT-1", "REQ-1", "PART-A", 6, expiry, now)
+	must(err)
+	_, err = s.Reserve("COMMIT-2", "REQ-2", "PART-A", 3, expiry, now)
+	must(err)
+
+	// 从六件承诺中领取两件：扣减承诺未用数量与实物库存。
+	u, err := s.Use("USE-1", "COMMIT-1", 2, now)
+	must(err)
+	fmt.Println(u.ID, u.CommitmentID, u.Quantity) // USE-1 COMMIT-1 2
+
+	// 此时：实物剩余八件（10-2），有效占用七件（COMMIT-1 未用四件
+	// 加 COMMIT-2 三件），可承诺一件（8-7）。
+	ps, err := s.PartStatus("PART-A", now)
+	must(err)
+	fmt.Println(ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable) // 8 7 1
+
+	// 取消已部分使用的 COMMIT-1：只释放尚未使用的四件（6-2），
+	// 不是把原定六件全部算作释放；已领走的两件实物不会退回库存。
+	c, err := s.Cancel("COMMIT-1", now)
+	must(err)
+	fmt.Println(c.Quantity, c.Used, c.Canceled) // 6 2 true
+
+	// 取消后：实物仍是八件，有效占用降为三件（只剩 COMMIT-2），可承诺增为
+	// 五件。可承诺从一件增到五件，增量四件正是 COMMIT-1 取消前的未用数量。
+	ps, err = s.PartStatus("PART-A", now)
+	must(err)
+	fmt.Println(ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable) // 8 3 5
+
+	// 取消后的备件查询仍展示原承诺明细：原数量六件、已用两件、未用四件，
+	// 状态 canceled；COMMIT-2 的数量、归属、到期时刻与状态都保持原值。
+	for _, d := range ps.Details {
+		fmt.Printf("%s %s qty=%d used=%d unused=%d expiry=%s status=%s\n",
+			d.CommitmentID, d.RequestID, d.OriginalQuantity, d.UsedQuantity,
+			d.RemainingQuantity, d.Expiry.Format("2006-01-02"), d.Status)
+	}
+
+	// 取消后的请求查询同样保留这条明细：未用四件是保留的数量事实，不代表
+	// 原承诺还能领取，也不能与仍有效的三件相加算作当前占用。
+	rv, err := s.RequestView("REQ-1", now)
+	must(err)
+	d := rv.Commitments[0]
+	fmt.Println(d.OriginalQuantity, d.UsedQuantity, d.RemainingQuantity, d.Status) // 6 2 4 canceled
+
+	// 新的合格请求把五件可承诺数量全部预留：这五件来自原有的一件余量加上
+	// 取消释放的四件——释放的数量可以供其他请求使用。
+	must(s.SubmitRequest("REQ-3", "P1", "NOISE"))
+	_, err = s.Reserve("COMMIT-3", "REQ-3", "PART-A", 5, expiry, now)
+	must(err)
+	ps, err = s.PartStatus("PART-A", now)
+	must(err)
+	fmt.Println(ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable) // 8 8 0
+
+	// 用尚未成功过的使用编号向已取消承诺领取一件：预期拒绝 ErrCommitmentClosed。
+	_, err = s.Use("USE-2", "COMMIT-1", 1, now)
+	expectErr(err, warranty.ErrCommitmentClosed)
+
+	// 失败不扣实物、不改已用：账目与 COMMIT-1 的已用数量保持不变。
+	ps, err = s.PartStatus("PART-A", now)
+	must(err)
+	fmt.Println(ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable) // 8 8 0
+	c, err = s.Commitment("COMMIT-1")
+	must(err)
+	fmt.Println(c.Used) // 2
+
+	// 已有成功使用的原样重试（编号、承诺、数量一致）仍按原规则取回旧记录，
+	// 不是取消后又领走了备件：已用数量不变，账目不变。
+	u, err = s.Use("USE-1", "COMMIT-1", 2, now)
+	must(err)
+	fmt.Println(u.ID, u.CommitmentID, u.Quantity) // USE-1 COMMIT-1 2
+	c, err = s.Commitment("COMMIT-1")
+	must(err)
+	fmt.Println(c.Used) // 2
+}
+```
+
+程序输出：
+
+```text
+USE-1 COMMIT-1 2
+8 7 1
+6 2 true
+8 3 5
+COMMIT-1 REQ-1 qty=6 used=2 unused=4 expiry=2026-02-10 status=canceled
+COMMIT-2 REQ-2 qty=3 used=0 unused=3 expiry=2026-02-10 status=active
+6 2 4 canceled
+8 8 0
+8 8 0
+2
+USE-1 COMMIT-1 2
+2
+```
+
+结果说明：
+
+- 领取两件后账目为 `8 / 7 / 1`：实物只剩八件，有效占用是 COMMIT-1 未用的
+  四件加 COMMIT-2 的三件，可承诺只剩一件。
+- 取消 COMMIT-1 后账目变为 `8 / 3 / 5`：实物不变（已领走的两件不退回），
+  有效占用只剩 COMMIT-2 的三件，可承诺增加的**四件**对应原承诺尚未使用的
+  四件（6−2），而不是原定的六件。COMMIT-2 继续有效，数量、归属请求和到期
+  时刻保持原值。
+- 取消后的请求查询与备件查询都仍展示原承诺：`6 / 2 / 4 canceled`。这四件
+  未用数量只是保留的事实，既不能再领取，也不与仍有效的三件相加计入占用。
+- REQ-3 把五件可承诺数量全部预留后，账目为 `8 / 8 / 0`：这五件 = 原有的一件
+  余量 + 取消释放的四件，释放的数量确实可供其他请求使用。
+- 新使用编号 `USE-2` 向已取消承诺领取一件被 `ErrCommitmentClosed` 拒绝，
+  账目与已用数量保持 `8 / 8 / 0` 和 `2` 不变；而已有成功使用 `USE-1` 的
+  原样重试仍取回首次的旧记录，已用数量仍是两件——这是幂等重试取回旧结果，
+  不是取消之后又领走了备件。
+
 ## 故障代码除外按完整字符串精确匹配
 
 除外清单在 `RegisterProduct` 时随产品资料登记；判断资格时，把请求提交的故障
