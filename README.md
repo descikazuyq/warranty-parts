@@ -646,6 +646,193 @@ REQ-3 fault=" BROKEN_SEAL " eligible=true excluded=false reasons=[]
 - 空清单产品 `P0` 正常登记；含空字符串条目的 `PX` 返回 `ErrInvalidParam` 且
   不落库；空故障代码请求 `REQ-BAD` 同样返回 `ErrInvalidParam`、不落库。
 
+## 首次预留被拒后，可承诺数量为什么还可能增加
+
+一次首次预留因为资格不合格返回 `ErrIneligible` 时，本次确实**没有创建任何新
+承诺**，被拒数量也没有进入占用；但这**不意味着备件账目与提交前逐项相同**。
+被拒提交在处理过程中仍会先做两件与自身成败无关的维护：按本次当前时刻**确认
+该备件下恰好到期的旧承诺**，再按确认后的状态核算库存依据、判断资格。本次没有
+新建承诺，可同种备件的**旧承诺却可能已经确认到期**：它尚未使用的预留占用被
+永久释放，于是即使新预留被拒，可承诺数量仍可能比提交前增加。
+
+要点是把“本次新增了什么”和“旧承诺发生了什么”分开看：
+
+- **被拒的新承诺不落库**：用新编号查询承诺得到 `ErrNotFound`，被拒数量不增加
+  有效占用，失败不占用承诺编号，之后仍可用该编号重新提交。
+- **到期的旧承诺照常释放**：参数合法、引用齐全的预留会先确认该备件下当前时刻
+  已达到到期时刻的旧承诺（仅本次涉及的该备件，且只确认尚未确认过的）。旧承诺
+  一旦确认到期，它**未用**的数量永久移出有效占用、重新计入可承诺；这一释放是
+  旧承诺自身到期的结果，不取决于紧随其后的资格判断是否通过，也不增加实物库存。
+- **已经领走的实物不返还**：到期只释放未用占用，旧承诺明细仍保留原数量、已用、
+  未用与到期时刻，状态变为 `expired`；此前成功领取扣减的实物不会因到期回到仓库。
+- **失败历史记录的是释放后的依据**：`ineligible` 记录的资格依据显示命中除外，
+  库存依据是**旧承诺释放之后**核算出的实物剩余 / 有效占用 / 可承诺，而不是空
+  依据，也不是释放前的旧账目。因此“请求被拒”和“可承诺增加”可以同时成立：
+  增加来自旧承诺到期，而非来自这次失败。
+- **到期确认来自这次合法预留本身**：确认只发生在参数校验与引用查找通过之后。
+  不要在到期时刻先调用 `PartStatus`/`RequestView`“看一眼”——那两个查询本身
+  也会确认到期，会把释放提前到查询时刻，示例就无法体现释放是这次预留触发的。
+  示例因此刻意在到期时刻**不做任何查询**，直接提交合法预留。
+
+还要区分**提前失败**：空编号、非正数量、到期时刻未晚于当前时刻等参数非法，或
+引用对象不存在的调用，在到期确认之前就返回，**不会借本次时刻确认任何承诺
+到期**，旧承诺保持有效、占用不释放；对应历史类别为 `invalid_param`，资格依据与
+库存依据**均为空**（不用合格或零库存替代）。两条失败历史按处理顺序保留，失败
+均不占用承诺编号。
+
+下面是可直接采用的完整示例，全程使用同一个仓库实例与固定时刻：登记十件备件，
+以及购买时间已到、保修期未结束的产品 `P1`；先为未命中除外代码的 `REQ-1` 在
+到期前成功预留四件，并在到期前领取两件，得到实物八件、有效占用两件、可承诺
+六件的账目。另一请求 `REQ-2` 关联同一产品，但故障代码与登记的除外清单精确
+匹配。在旧承诺恰好到期的同一时刻，先用一个新编号为 `REQ-2` 提交**零数量**
+预留（提前失败，不确认到期），再用尚未成功过的另一个新编号提交一件、到期
+时刻晚于本次时刻的合法预留（其余参数合法、引用齐全）：后者返回 `ErrIneligible`，
+却同时确认旧承诺到期并释放未用两件。
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/descikazuyq/warranty-parts/warranty"
+)
+
+func main() {
+	s := warranty.NewStore()
+	// must 用于预期成功的操作：遇到意外错误立即停止，不继续输出成功结果。
+	must := func(err error) {
+		if err != nil {
+			panic(err)
+		}
+	}
+	// expectErr 用于预期拒绝：错误必须恰好是目标原因，否则立即停止，
+	// 不把真正的意外错误当成“预期拒绝”略过。
+	expectErr := func(err error, target error) {
+		if !errors.Is(err, target) {
+			panic(fmt.Sprintf("want %v, got %v", target, err))
+		}
+	}
+
+	// 固定时刻：2026-01-01 购买、保修六十天（截止 2026-03-02），下面全部当前
+	// 时刻都在保修期内；旧承诺到期时刻取第 40 天，仍在保修期内。
+	purchase := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	reserveAt := purchase.AddDate(0, 0, 10)    // 2026-01-11，保修期内、旧承诺到期前
+	commitExpiry := purchase.AddDate(0, 0, 40) // 2026-02-10，旧承诺到期时刻（保修期内）
+	newExpiry := purchase.AddDate(0, 0, 50)    // 2026-02-20，晚于本次当前时刻
+
+	// 登记：购买时刻已到、保修期未结束，除外清单只有精确的 BROKEN_SEAL；备件十件。
+	must(s.RegisterProduct("P1", purchase, 60, []string{"BROKEN_SEAL"}))
+	must(s.RegisterPart("PART-A", 10))
+	// 两张请求关联同一产品：REQ-1 故障代码未命中除外，REQ-2 精确命中 BROKEN_SEAL。
+	must(s.SubmitRequest("REQ-1", "P1", "NOISE"))
+	must(s.SubmitRequest("REQ-2", "P1", "BROKEN_SEAL"))
+
+	// 到期前为未命中除外代码的 REQ-1 成功预留四件，并在到期前领取两件。
+	c, err := s.Reserve("COMMIT-1", "REQ-1", "PART-A", 4, commitExpiry, reserveAt)
+	must(err)
+	fmt.Println("reserve :", c.ID, c.Quantity, c.Used)
+	u, err := s.Use("USE-1", "COMMIT-1", 2, reserveAt)
+	must(err)
+	fmt.Println("use     :", u.ID, u.CommitmentID, u.Quantity)
+
+	// 到期前的账目：实物八件、有效占用两件（旧承诺未用）、可承诺六件。
+	ps, err := s.PartStatus("PART-A", reserveAt)
+	must(err)
+	fmt.Println("before  :", ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable)
+
+	// 关键：接下来不在 commitExpiry 时刻先查库存或请求——那会由查询提前确认
+	// 旧承诺到期、提前释放两件占用。到期确认要留给随后的合法预留本身。
+
+	// 提前失败：在同一到期时刻，先为命中除外的 REQ-2 提交零数量预留。
+	// 到期时刻本身合法（晚于当前时刻），但数量非正，整次在参数阶段即失败。
+	_, err = s.Reserve("COMMIT-0", "REQ-2", "PART-A", 0, newExpiry, commitExpiry)
+	expectErr(err, warranty.ErrInvalidParam)
+	fmt.Println("zero    :", errors.Is(err, warranty.ErrInvalidParam))
+	// 失败不占用承诺编号。
+	_, err = s.Commitment("COMMIT-0")
+	expectErr(err, warranty.ErrNotFound)
+	// 提前失败不确认旧承诺到期：换回更早时刻查库存，旧承诺仍占两件，账目不变。
+	ps, err = s.PartStatus("PART-A", reserveAt)
+	must(err)
+	fmt.Println("after0  :", ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable)
+
+	// 合法提交：用尚未成功过的新编号 COMMIT-2 为 REQ-2 预留一件；
+	// 数量为正、到期时刻晚于当前时刻，请求、备件、产品等引用齐全。
+	_, err = s.Reserve("COMMIT-2", "REQ-2", "PART-A", 1, newExpiry, commitExpiry)
+	expectErr(err, warranty.ErrIneligible)
+	fmt.Println("denied  :", errors.Is(err, warranty.ErrIneligible))
+	// 新编号查不到承诺：本次没有创建新承诺、没有新增占用。
+	_, err = s.Commitment("COMMIT-2")
+	expectErr(err, warranty.ErrNotFound)
+
+	// 这次合法预留先按本次时刻确认该备件已到期的旧承诺、再核算库存并判资格：
+	// 旧承诺把未用两件移出有效占用；实物仍是八件，有效占用降为零，可承诺增为八件。
+	ps, err = s.PartStatus("PART-A", commitExpiry)
+	must(err)
+	fmt.Println("after   :", ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable)
+	d := ps.Details[0]
+	fmt.Println("old     :", d.OriginalQuantity, d.UsedQuantity, d.RemainingQuantity, d.Status)
+
+	// 两条失败历史按处理顺序保留：先 invalid_param（资格与库存依据均为空），
+	// 后 ineligible（命中除外；库存依据是旧承诺释放后的 8/0/8）。
+	h, err := s.RequestHistory("REQ-2")
+	must(err)
+	fmt.Println("records :", len(h))
+	for _, r := range h {
+		fmt.Printf("#%d %s elig-nil=%v basis-nil=%v\n", r.Seq, r.Error,
+			r.Eligibility == nil, r.StockBasis == nil)
+		if r.Eligibility != nil {
+			fmt.Printf("  eligible=%v excluded=%v reasons=%v\n",
+				r.Eligibility.Eligible, r.Eligibility.Excluded, r.Eligibility.Reasons)
+		}
+		if r.StockBasis != nil {
+			fmt.Printf("  stock=%d/%d/%d\n",
+				r.StockBasis.PhysicalRemaining, r.StockBasis.ActiveOccupied, r.StockBasis.Committable)
+		}
+	}
+}
+```
+
+程序输出：
+
+```text
+reserve : COMMIT-1 4 0
+use     : USE-1 COMMIT-1 2
+before  : 8 2 6
+zero    : true
+after0  : 8 2 6
+denied  : true
+after   : 8 0 8
+old     : 4 2 2 expired
+records : 2
+#1 invalid_param elig-nil=true basis-nil=true
+#2 ineligible elig-nil=false basis-nil=false
+  eligible=false excluded=true reasons=[fault_code_excluded]
+  stock=8/0/8
+```
+
+结果对应说明（账目中的三项依次为实物剩余 / 有效占用 / 可承诺）：
+
+- 到期前预留四件、领取两件后，`before:` 为 `8 / 2 / 6`：预留不扣实物，领取
+  扣两件实物；旧承诺未用两件计入有效占用。
+- 同一到期时刻的零数量预留返回 `ErrInvalidParam`（`zero: true`），编号
+  `COMMIT-0` 查不到承诺；`after0:` 仍是 `8 / 2 / 6`，说明**提前失败没有确认
+  旧承诺到期**，两件占用未被释放。这条历史是序号 1 的 `invalid_param`，资格与
+  库存依据均为 `nil`。
+- 随后的一件合法预留返回 `ErrIneligible`（`denied: true`），编号 `COMMIT-2`
+  同样查不到承诺：本次没有创建新承诺、没有新增占用。但它在判资格前先确认了该
+  备件下恰好到期的旧承诺，释放未用两件。
+- `after:` 为 `8 / 0 / 8`：实物仍为八件（没有新领取，到期也不返还已领实物），
+  有效占用降为零，可承诺由六件**增为八件**——增加全部来自旧承诺到期释放，与
+  本次被拒并不矛盾。旧承诺明细保留 `4 / 2 / 2 expired`，已领走的两件不会返还。
+- 序号 2 的 `ineligible` 记录把失败历史与数量变化对应起来：资格依据显示
+  不合格、命中除外（`excluded=true`，原因恰为 `fault_code_excluded`），库存
+  依据是**释放后**的 `stock=8/0/8`，既不是空依据，也不是释放前的 `8/2/6`。
+  两条失败记录按处理顺序保留，失败均不占用承诺编号。
+
 ## 规则要点
 
 - 产品、备件、请求编号重复登记一律报错（`ErrDuplicateID`）且保留原记录。
