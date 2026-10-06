@@ -280,6 +280,141 @@ func main() {
 返回 `ErrCommitmentClosed`，账目变为 `8 / 0 / 8`，明细保留 `4 / 2 / 2 expired`。
 到期释放的只是未用的两件占用，已经领走的两件实物不会因此回到库存。
 
+## 故障代码除外：按完整字符串精确匹配
+
+除外清单的匹配方式是**按登记时给出的完整字符串精确匹配**：区分大小写，
+首尾空格也属于代码内容。提交请求（`SubmitRequest`）和判断资格（`Evaluate`、
+`RequestView`、`Reserve` 内部的资格判断）都**不会**替调用方把故障代码转成
+大写、删掉首尾或中间的空格，也不会做部分匹配——清单里登记了 `BROKEN_SEAL`，
+就只有原样的 `BROKEN_SEAL` 命中；`broken_seal`（大小写不同）和
+`" BROKEN_SEAL "`（首尾各带一个空格）都是另外三个不同的代码，均不命中。
+
+这里同样要区分两件事：
+
+- **请求已保存**：`SubmitRequest` 成功只代表请求编号、产品编号与故障代码
+  （原样、含大小写与空格）已落库，之后用 `Request` 能取回原代码；它不代表
+  资格已经成立。
+- **已经符合保修资格**：资格按当次当前时刻、购买时刻、保修期限与除外清单
+  逐项判断。命中除外代码的请求不合格，拒绝原因只有 `fault_code_excluded`；
+  未命中的请求（哪怕只是大小写或空格不同）不受除外清单影响。
+
+还要区分**空除外清单**与**清单内的空字符串**：
+
+- 空清单（`nil` 或 `[]string{}`）是合法登记，表示该产品不按故障代码除外，
+  任何非空故障代码都不会命中。
+- 清单内包含空字符串（如 `[]string{""}`）不是“空清单”：`RegisterProduct`
+  返回 `ErrInvalidParam`，产品**不保存**。同理，首次提交请求时故障代码为
+  空字符串也返回 `ErrInvalidParam`，请求**不保存**。
+
+下面是可直接采用的完整示例，全程使用同一个仓库实例与固定的保修期内时刻：
+登记购买时刻已到、保修三十天的产品，除外清单只包含 `BROKEN_SEAL`，另登记
+十件备件；提交故障代码分别为 `BROKEN_SEAL`、`broken_seal` 和首尾各带一个
+空格的 `" BROKEN_SEAL "` 的三张请求，逐一查看资格后用不同的承诺编号各预留
+一件同种备件。输出用 `%q` 打印故障代码，让空格在结果中可见。
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/descikazuyq/warranty-parts/warranty"
+)
+
+func main() {
+	s := warranty.NewStore()
+	must := func(err error) {
+		if err != nil {
+			panic(err) // 正常分支遇到意外错误立即停止，不继续输出成功结果
+		}
+	}
+
+	// 固定时刻：2026-01-01 购买，保修期三十天；当前时刻在保修期内。
+	purchase := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	now := purchase.AddDate(0, 0, 10)    // 2026-01-11，购买时刻已到、保修期内
+	expiry := purchase.AddDate(0, 0, 40) // 2026-02-10，晚于当前时刻
+
+	// 除外清单只登记一个代码 BROKEN_SEAL；备件初始库存十件。
+	must(s.RegisterProduct("P1", purchase, 30, []string{"BROKEN_SEAL"}))
+	must(s.RegisterPart("PART-A", 10))
+
+	// 三张请求使用三个不同的故障代码字符串：精确命中、仅大小写不同、
+	// 首尾各带一个空格。三次提交都成功——保存成功只代表落库，不代表合格。
+	must(s.SubmitRequest("REQ-EXACT", "P1", "BROKEN_SEAL"))
+	must(s.SubmitRequest("REQ-LOWER", "P1", "broken_seal"))
+	must(s.SubmitRequest("REQ-PADDED", "P1", " BROKEN_SEAL "))
+
+	// 取回原故障代码：%q 让首尾空格可见，三个代码互不相同。
+	for _, id := range []string{"REQ-EXACT", "REQ-LOWER", "REQ-PADDED"} {
+		req, err := s.Request(id)
+		must(err)
+		fmt.Printf("%s 已保存，故障代码 %q\n", req.ID, req.FaultCode)
+	}
+	// REQ-EXACT 已保存，故障代码 "BROKEN_SEAL"
+	// REQ-LOWER 已保存，故障代码 "broken_seal"
+	// REQ-PADDED 已保存，故障代码 " BROKEN_SEAL "
+
+	// 资格查询：只有原样代码命中除外，拒绝原因只有 fault_code_excluded；
+	// 大小写不同或带空格的代码都不命中，两张请求合格、没有拒绝原因。
+	for _, id := range []string{"REQ-EXACT", "REQ-LOWER", "REQ-PADDED"} {
+		req, err := s.Request(id)
+		must(err)
+		rv, err := s.RequestView(id, now)
+		must(err)
+		fmt.Printf("故障代码 %q：合格 %v，拒绝原因 %v\n",
+			req.FaultCode, rv.Eligibility.Eligible, rv.Eligibility.Reasons)
+	}
+	// 故障代码 "BROKEN_SEAL"：合格 false，拒绝原因 [fault_code_excluded]
+	// 故障代码 "broken_seal"：合格 true，拒绝原因 []
+	// 故障代码 " BROKEN_SEAL "：合格 true，拒绝原因 []
+
+	// 用不同的承诺编号为三张请求各预留一件，到期时刻晚于当前时刻。
+	// 精确命中的请求：返回 ErrIneligible 是预期分支，不产生承诺、不占用库存。
+	_, err := s.Reserve("COMMIT-EXACT", "REQ-EXACT", "PART-A", 1, expiry, now)
+	fmt.Println(errors.Is(err, warranty.ErrIneligible)) // true（预期失败）
+	_, err = s.Commitment("COMMIT-EXACT")
+	fmt.Println(errors.Is(err, warranty.ErrNotFound)) // true（失败不占用编号）
+
+	// 另外两张请求各成功预留一件；意外错误由 must 中止，不会继续输出成功结果。
+	c, err := s.Reserve("COMMIT-LOWER", "REQ-LOWER", "PART-A", 1, expiry, now)
+	must(err)
+	fmt.Println(c.ID, c.Quantity) // COMMIT-LOWER 1
+	c, err = s.Reserve("COMMIT-PADDED", "REQ-PADDED", "PART-A", 1, expiry, now)
+	must(err)
+	fmt.Println(c.ID, c.Quantity) // COMMIT-PADDED 1
+
+	// 最终账目：实物仍为十件（预留不扣实物）、有效占用两件、可承诺八件。
+	ps, err := s.PartStatus("PART-A", now)
+	must(err)
+	fmt.Println(ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable) // 10 2 8
+
+	// 空除外清单是合法登记：该产品不按故障代码除外。
+	must(s.RegisterProduct("P2", purchase, 30, nil))
+
+	// 清单内的空字符串不是“空清单”：登记返回 ErrInvalidParam，产品不保存。
+	err = s.RegisterProduct("P3", purchase, 30, []string{""})
+	fmt.Println(errors.Is(err, warranty.ErrInvalidParam)) // true
+	_, err = s.Product("P3")
+	fmt.Println(errors.Is(err, warranty.ErrNotFound)) // true（未保存）
+
+	// 首次提交空故障代码同样返回 ErrInvalidParam，请求不保存。
+	err = s.SubmitRequest("REQ-EMPTY", "P1", "")
+	fmt.Println(errors.Is(err, warranty.ErrInvalidParam)) // true
+	_, err = s.Request("REQ-EMPTY")
+	fmt.Println(errors.Is(err, warranty.ErrNotFound)) // true（未保存）
+}
+```
+
+关键预期结果：三张请求都保存成功，取回的故障代码经 `%q` 打印为
+`"BROKEN_SEAL"`、`"broken_seal"`、`" BROKEN_SEAL "`，空格清晰可见；资格
+查询中只有原样代码不合格、拒绝原因只有 `fault_code_excluded`，另两张合格
+且无拒绝原因。`COMMIT-EXACT` 预留返回 `ErrIneligible`（预期分支），编号下
+没有承诺；`COMMIT-LOWER` 与 `COMMIT-PADDED` 各成功预留一件，最终账目为
+`10 / 2 / 8`。空清单产品 `P2` 登记成功；含空字符串清单的 `P3` 与空故障代码
+的 `REQ-EMPTY` 都返回 `ErrInvalidParam` 且均未保存。
+
 ## 规则要点
 
 - 产品、备件、请求编号重复登记一律报错（`ErrDuplicateID`）且保留原记录。
