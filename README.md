@@ -496,6 +496,201 @@ final:   physical=8 occupied=8 committable=0
   `final:` 仍为 `8 / 8 / 0`：幂等重试不再扣减实物，不能把它描述成取消后又领走
   了备件。
 
+## 使用编号在首次成功领取时才与内容绑定
+
+分批使用（`Use`）的使用编号全局唯一，但它与“领取内容”（承诺编号与数量；本次
+当前时刻不属于内容）的绑定只发生在**首次成功领取**的那一刻，并与扣减、明细
+落库在同一临界区内原子完成。“同编号同内容返回首次结果，换内容报 `ErrConflict`”
+容易被误读成“编号第一次提交就定死内容、被拒后必须换编号”，实际要把三类提交
+分开：
+
+- **失败提交不保存成功使用记录。** 一笔新使用被拒绝时——参数非法（空编号、
+  空承诺编号、非正数量，`ErrInvalidParam`）、引用未知承诺（`ErrNotFound`）、
+  承诺已取消或已到期（`ErrCommitmentClosed`），或本次数量超过该承诺的未用
+  数量（`ErrUsageExceeded`）——整次调用不产生任何扣减与使用记录：编号既没有
+  绑定到这笔承诺，被拒绝的数量也不会被记下来当作日后的冲突依据。
+- **尚未成功的编号修正内容后可以继续领取。** 因为编号还没有成功记录，随后沿用
+  同一编号、仍指向同一承诺，把数量改成不超过未用数量的合法值，就是一笔正常的
+  新使用；成功之后编号才绑定到这次的承诺编号与数量。同理，被业务拒绝后把同一
+  编号改指向一笔余量充足的其他承诺，也仍是合法新使用，不要求先更换编号。
+- **只有成功之后再改内容才是冲突。** 编号一旦有了成功记录，之后改承诺编号或
+  数量任一项即返回 `ErrConflict`，即使新内容本身非法（零数量、负数量、再次
+  超过余量）或新指向的承诺已取消、已到期，也一律按编号冲突处理；冲突不扣减、
+  不释放占用，也不覆盖已有的成功记录。原样重试（承诺编号与数量一致，当前时刻
+  可以不同）始终取回首次成功结果，不再次扣减。
+
+也就是说，两类拒绝回答的是不同问题：`ErrUsageExceeded` 针对**尚无成功记录的
+新使用**，回答“这笔承诺此刻给不出这么多”；`ErrConflict` 只可能发生在编号
+**已经成功之后**，回答“这个已成功的编号是否被换成了别的内容”。超量被绝不
+要求更换编号——分界点只有一个，就是该编号首次成功领取的那一刻。
+
+下面是可直接采用的完整示例，全程使用同一个仓库实例与固定时刻：产品始终在保、
+故障代码不在除外清单中，承诺全程未取消且未到期。登记十件备件，为一个已知请求
+预留五件；先用另一个使用编号成功领取两件，使承诺已用两件、未用三件，实物剩余
+八件、有效占用三件、可承诺五件。随后用一个从未成功过的使用编号领取四件——即使
+实物足够，也应得到 `ErrUsageExceeded`，整次不扣减，不能先领走允许的三件；
+承诺数量与三项库存账目保持原值，该承诺的成功使用明细仍只有此前两件的记录。接着
+沿用刚才失败的编号、仍指向原承诺，把数量改成三件，应成功返回这次使用的编号、
+承诺编号和数量；此后原样重取只拿回同一结果，再把数量改回最初被拒的四件才是
+`ErrConflict`，三件的成功结果与全部账目保留。预期拒绝处用 `errors.Is` 区分
+超量与编号冲突，任一分支出现意外错误都会立即停止，不再继续打印成功结果。
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/descikazuyq/warranty-parts/warranty"
+)
+
+func main() {
+	s := warranty.NewStore()
+	// must 用于预期成功的操作：遇到意外错误立即停止，不继续输出成功结果。
+	must := func(err error) {
+		if err != nil {
+			panic(err)
+		}
+	}
+	// expectErr 用于预期拒绝：错误必须恰好是目标原因，否则立即停止，
+	// 不把真正的意外错误当成“预期拒绝”略过。
+	expectErr := func(err error, target error) {
+		if !errors.Is(err, target) {
+			panic(fmt.Sprintf("want %v, got %v", target, err))
+		}
+	}
+
+	// 固定时刻：2026-01-01 购买、保修三百六十五天，示例全程在保；
+	// 全部操作取同一时刻，承诺全程未取消且未到期，故障代码 NOISE 不在除外清单。
+	purchase := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	now := purchase.AddDate(0, 0, 10)    // 2026-01-11，保修期内
+	expiry := purchase.AddDate(0, 0, 40) // 2026-02-10，晚于全部操作时刻
+
+	// 登记：产品始终在保、故障代码不命中除外；备件初始库存十件。
+	must(s.RegisterProduct("P1", purchase, 365, []string{"BROKEN_SEAL"}))
+	must(s.RegisterPart("PART-A", 10))
+	must(s.SubmitRequest("REQ-1", "P1", "NOISE"))
+
+	// 为这个已知请求预留五件。
+	_, err := s.Reserve("COMMIT-1", "REQ-1", "PART-A", 5, expiry, now)
+	must(err)
+
+	// state 打印承诺数量（原定/已用/未用）、三项库存账目
+	// （实物剩余/有效占用/可承诺）与该承诺的成功使用明细。
+	state := func(label string) {
+		c, err := s.Commitment("COMMIT-1")
+		must(err)
+		ps, err := s.PartStatus("PART-A", now)
+		must(err)
+		fmt.Printf("%-8s commit=%d/%d/%d stock=%d/%d/%d\n",
+			label, c.Quantity, c.Used, c.Unused(),
+			ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable)
+		us, err := s.CommitmentUsages("COMMIT-1")
+		must(err)
+		text := "(none)"
+		sum := 0
+		if len(us) > 0 {
+			text = ""
+			for i, u := range us {
+				if i > 0 {
+					text += " "
+				}
+				text += fmt.Sprintf("%s@%s:%d", u.ID, u.CommitmentID, u.Quantity)
+				sum += u.Quantity
+			}
+		}
+		fmt.Printf("%-8s usages count=%d sum=%d: %s\n", label, len(us), sum, text)
+	}
+
+	// 先用另一个使用编号成功领取两件。
+	u2, err := s.Use("USE-1", "COMMIT-1", 2, now)
+	must(err)
+	fmt.Printf("use      : %s@%s qty=%d\n", u2.ID, u2.CommitmentID, u2.Quantity)
+	// 承诺已用两件、未用三件；实物剩余八件、有效占用三件、可承诺五件；
+	// 成功使用明细只有这两件一次。
+	state("setup:")
+
+	// 用一个从未成功过的使用编号领取四件：本笔承诺未用仅三件。
+	// 即使实物足够（八件），也是超过本笔承诺未用数量的新使用，
+	// 必须整次失败：不能先领走允许的三件，也不能提前占住 USE-2。
+	_, err = s.Use("USE-2", "COMMIT-1", 4, now)
+	exceeded := errors.Is(err, warranty.ErrUsageExceeded)
+	expectErr(err, warranty.ErrUsageExceeded) // 是超量拒绝，不是编号冲突
+	fmt.Println("exceeded :", exceeded)
+	// 承诺数量与三项库存账目保持原值；成功使用明细仍只有此前两件。
+	state("denied4:")
+
+	// 沿用刚才失败的编号，仍指向原承诺，把数量改成三件：
+	// 失败不占编号，这是合法的新使用，应当成功。
+	u3, err := s.Use("USE-2", "COMMIT-1", 3, now)
+	must(err)
+	fmt.Printf("use      : %s@%s qty=%d\n", u3.ID, u3.CommitmentID, u3.Quantity)
+	// 承诺累计已用五件、未用零件；实物五件、有效占用零件、可承诺五件；
+	// 成功使用明细是两件和三件两次领取，合计五件。
+	state("took3:")
+
+	// 再次按相同编号、承诺和三件数量提交：取回同一成功结果，
+	// 不再扣减，也不增加明细。
+	u3again, err := s.Use("USE-2", "COMMIT-1", 3, now)
+	must(err)
+	fmt.Printf("retry    : %s@%s qty=%d same=%v\n",
+		u3again.ID, u3again.CommitmentID, u3again.Quantity, u3again == u3)
+	state("retry3:")
+
+	// 再把数量改回最初被拒绝的四件：编号内容已由三件的首次成功确定，
+	// 这时才是编号冲突；三件的成功结果与全部账目都保留。
+	_, err = s.Use("USE-2", "COMMIT-1", 4, now)
+	conflict := errors.Is(err, warranty.ErrConflict)
+	expectErr(err, warranty.ErrConflict)
+	fmt.Println("conflict :", conflict)
+	state("final:")
+}
+```
+
+程序输出：
+
+```text
+use      : USE-1@COMMIT-1 qty=2
+setup:   commit=5/2/3 stock=8/3/5
+setup:   usages count=1 sum=2: USE-1@COMMIT-1:2
+exceeded : true
+denied4: commit=5/2/3 stock=8/3/5
+denied4: usages count=1 sum=2: USE-1@COMMIT-1:2
+use      : USE-2@COMMIT-1 qty=3
+took3:   commit=5/5/0 stock=5/0/5
+took3:   usages count=2 sum=5: USE-1@COMMIT-1:2 USE-2@COMMIT-1:3
+retry    : USE-2@COMMIT-1 qty=3 same=true
+retry3:  commit=5/5/0 stock=5/0/5
+retry3:  usages count=2 sum=5: USE-1@COMMIT-1:2 USE-2@COMMIT-1:3
+conflict : true
+final:   commit=5/5/0 stock=5/0/5
+final:   usages count=2 sum=5: USE-1@COMMIT-1:2 USE-2@COMMIT-1:3
+```
+
+结果对应说明（`commit=` 三项依次为原定 / 已用 / 未用，`stock=` 三项依次为
+实物剩余 / 有效占用 / 可承诺）：
+
+- `USE-1` 领取两件后的 `setup:` 为 `commit=5/2/3`、`stock=8/3/5`：承诺已用
+  两件、未用三件；实物从十件降到八件，未用三件计入有效占用，可承诺为五件；
+  成功使用明细只有 `USE-1@COMMIT-1:2` 一条，合计两件。
+- `USE-2` 领取四件得到 `exceeded : true`，即 `ErrUsageExceeded` 而非
+  `ErrConflict`：这是尚无成功记录的新使用超过**本笔承诺**的未用三件，即使
+  仓库里还有八件实物也不能借用，更不能先领走允许的三件。`denied4:` 与
+  `setup:` 完全相同——整次不扣减，承诺数量、三项库存账目保持原值，明细仍
+  只有此前两件；被拒绝的四件没有留下任何记录。
+- 沿用同一失败编号 `USE-2`、仍指向 `COMMIT-1`、数量改成三件后成功，返回
+  `USE-2@COMMIT-1 qty=3`：编号此刻才首次成功并绑定到“`COMMIT-1`、三件”。
+  `took3:` 为 `commit=5/5/0`、`stock=5/0/5`：承诺累计已用五件、未用零件，
+  实物五件、有效占用零件、可承诺五件；明细是两件与三件两次领取，合计五件。
+- 按相同编号、承诺和三件数量再次提交，取回同一结果（`same=true`），
+  `retry3:` 不发生任何扣减，明细仍是两条、合计五件。
+- 再把数量改回最初被拒的四件得到 `conflict : true`：同一个四件，第一次是
+  超量（编号尚未成功），这一次却是编号冲突（编号已被三件的首次成功绑定），
+  分界正是三件成功的那一刻。`final:` 中三件的成功结果与 `5/0/5` 的账目全部
+  保留，明细仍是合计五件的两条记录。
+
 ## 故障代码除外按完整字符串精确匹配
 
 除外清单在 `RegisterProduct` 时随产品资料登记；判断资格时，把请求提交的故障
@@ -1035,8 +1230,15 @@ unknown id : ErrNotFound
   记录或用 `PartStatus`、`RequestView` 核对；此前保存的旧副本不随后续确认
   更新，按早于到期的时刻仍可能显示 active，不能替代重新查询。已取消记录始终
   显示 canceled，未知承诺编号取回返回 ErrNotFound。
-- 预留与使用均支持幂等重试：同编号同内容返回首次结果，换内容报
-  `ErrConflict`；成功的使用在承诺取消或到期后重试仍返回原结果。
+- 预留与使用均支持幂等重试，但“同编号同内容返回首次结果，换内容报
+  `ErrConflict`”只适用于**已经成功过一次**的编号：编号与内容的绑定只由该编号
+  的首次成功提交确定，且首次成功与落库在同一临界区内原子完成；此前的失败提交
+  （参数非法、对象不存在、资格不合格、库存不足、使用超量、承诺已关闭等）不保存
+  任何成功记录，既不占用编号，也不把被拒绝的内容记成冲突依据。因此一次失败后
+  无需更换编号：沿用同一编号、把提交修正为合法内容即可正常成功；只有在编号已经
+  成功之后再改内容（预留改请求、备件、数量或到期时刻任一项；使用改承诺编号或
+  数量），才返回 `ErrConflict`。成功的使用在承诺取消或到期后原样重试仍返回
+  原结果。
 - 已成功预留的编号原样重试（承诺编号、请求编号、备件编号、数量、到期时刻一致；
   本次当前时刻不属于提交内容，到期时刻按实际时刻比较，换时区表示仍算一致）始终
   返回首次预留成功时的完整承诺（已用数量为零、未取消）：即使请求后来过保、库存
@@ -1046,8 +1248,13 @@ unknown id : ErrNotFound
 - 已成功预留的编号只要改了请求、备件、数量或到期时刻任一项即返回 `ErrConflict`，
   即使新参数本身非法（空请求、未知备件、零数量、已过去的到期时刻）也按编号冲突
   处理；冲突失败记录挂到本次指定的已知请求下，请求为空或不存在时不创建请求和
-  历史。尚未成功占用的编号继续按本次参数、资格和库存判断，失败后可再次提交。
-- 使用数量超过承诺未用数量时整次失败；已全部使用的承诺不再接受新使用。
+  历史。尚未成功过的编号（包括此前已经失败过的编号）不保存任何成功记录，
+  继续按本次参数、资格和库存判断；失败后沿用同一编号把内容改成合法值即可
+  正常成功，先前被拒绝的内容不构成冲突依据。
+- 使用数量超过承诺未用数量时整次失败：不扣减承诺已用数量与实物库存、不产生
+  使用明细，也不占用使用编号或把被拒绝的数量记成冲突依据——既不会先领走允许
+  的部分，也不借用其他承诺的余量；随后沿用同一编号、仍指向同一承诺，把数量
+  改成不超过未用数量的合法值即可正常成功。已全部使用的承诺不再接受新使用。
 - 同一承诺编号在首次成功预留前被不同内容（不同请求、备件、数量或到期时刻）
   并发抢占时，只能有一份内容成为首次承诺：与其完全相同的提交全部成功并返回
   同一份完整首次承诺（已用数量为零、未取消），另一组全部返回 `ErrConflict`，
