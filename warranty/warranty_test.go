@@ -308,9 +308,14 @@ func TestUsePartialAndExceedsFailsWhole(t *testing.T) {
 	if st.PhysicalRemaining != 5 {
 		t.Fatalf("physical remaining = %d, want 5", st.PhysicalRemaining)
 	}
-	// 已全部使用：新使用失败。
-	if _, err := s.Use("u3", "c1", 1, nowOK); !errors.Is(err, ErrCommitmentClosed) && !errors.Is(err, ErrUsageExceeded) {
-		t.Fatalf("use on fully-used: got %v", err)
+	// 已全部使用但仍 active（未取消、未到期）：这是数量不足，不是承诺关闭，
+	// 新使用必须恰好返回 ErrUsageExceeded，不能与 ErrCommitmentClosed 互换。
+	_, err := s.Use("u3", "c1", 1, nowOK)
+	if !errors.Is(err, ErrUsageExceeded) {
+		t.Fatalf("use on fully-used active commitment: got %v, want ErrUsageExceeded", err)
+	}
+	if errors.Is(err, ErrCommitmentClosed) {
+		t.Fatalf("fully-used active commitment must not report ErrCommitmentClosed: %v", err)
 	}
 
 	// 超未用数量：整次失败，不扣减。
