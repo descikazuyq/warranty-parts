@@ -1453,6 +1453,229 @@ unknown id : ErrNotFound
 - 已取消的承诺无论传入什么时刻都显示 `canceled`（取消优先于到期）；按未知
   承诺编号取回记录返回 `ErrNotFound`。
 
+## 直接查询保修资格：只判资格，不动承诺与库存
+
+想知道一张请求“此刻是否合格”，有两个公开入口都会按当次时刻重新判断资格，
+但它们对既有承诺做的事不同，调用方应按需选择：
+
+- **`Evaluate(requestID, now)`：直接资格查询，纯只读。** 只按本次时刻计算并返回
+  资格依据（购买时刻、保修天数、保修截止时刻、故障代码是否命中除外）与拒绝原因；
+  不确认任何承诺到期、不释放未用占用、不改变实物库存或承诺已用数量、不写入取消
+  标记，也不追加预留历史。即使传入时刻已经晚于关联承诺的到期时刻，也不会借这次
+  查询确认到期——过保与否和承诺到期与否是两件事。只想探测资格、又不希望一次查询
+  改变备件账目或承诺状态时，用它。
+- **`RequestView(requestID, now)`：带承诺明细的查询。** 除资格依据外还返回该请求
+  的全部关联承诺明细；前面的章节已经介绍，它在返回前会按本次时刻**确认关联承诺
+  到期**：本次时刻达到承诺到期时刻的记录被永久标记为 expired，未用占用随即释放、
+  重新计入可承诺数量。需要在同一时刻把“资格 + 承诺账目”一次结清时，用它。
+- **“不合格”是正常查询结果，不是查询失败。** `Evaluate` 在产品资料齐全时始终
+  正常返回 `(*Eligibility, nil)`：过保、命中除外都体现在 `Eligible=false` 和
+  `Reasons` 里（如只有 `warranty_expired` 一项），调用本身**不返回 `ErrIneligible`**；
+  `ErrIneligible` 是 `Reserve` 在资格不合格时的失败结果。`Eligibility` 上的购买
+  时刻、保修天数与保修截止时刻始终反映登记资料，不随查询时刻改变。
+- **资格判断与承诺到期确认是两种操作，不能互相替代。** 直接查询得到
+  `warranty_expired` 只说明新的首次预留不再合格，**不等于既有承诺已取消、也不等于
+  未用占用已释放**。要结清承诺，必须通过会确认到期的操作（`RequestView`、
+  `PartStatus`、合法的 `Reserve` 或新的 `Use`）。
+- **失败的直接查询同样不改动任何状态。** 空请求编号返回 `ErrInvalidParam`；请求
+  未登记，或请求已登记但关联产品未登记，都返回 `ErrNotFound`。这些失败既不产生
+  资格结果，也不确认到期、不修改承诺或库存。
+
+下面是可直接采用的完整示例，全程使用同一个仓库实例与固定时刻：产品保修三十天、
+故障 `NOISE` 未命中除外清单；备件初始库存十二件，购买后第五天预留七件并领取三件，
+承诺在购买后第十五天到期。领取后实物剩余九件、有效占用四件、可承诺五件。示例在
+购买后第三十一天先调用 `Evaluate` 直接查询资格，并刻意只用早于承诺到期的时刻核对
+库存，因此在展示直接查询结果之前不会有任何操作确认到期；随后再用 `RequestView`
+查看同一请求的资格与承诺明细，对比两次查询的差别。预期错误用显式分支校验，遇到
+非预期错误立即停止。
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/descikazuyq/warranty-parts/warranty"
+)
+
+func main() {
+	s := warranty.NewStore()
+	// must 用于预期成功的操作：遇到意外错误立即停止，不继续输出成功结果。
+	must := func(err error) {
+		if err != nil {
+			panic(err)
+		}
+	}
+	// expectErr 用于预期失败：错误必须恰好是目标原因，否则立即停止，
+	// 不把真正的意外错误当成“预期失败”略过。
+	expectErr := func(err error, target error) {
+		if !errors.Is(err, target) {
+			panic(fmt.Sprintf("want %v, got %v", target, err))
+		}
+	}
+
+	// 固定时刻：2026-01-01 购买，保修期三十天（保修截止为 2026-01-31 00:00 UTC）。
+	purchase := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	day5 := purchase.AddDate(0, 0, 5)   // 2026-01-06，预留与领取的时刻
+	day15 := purchase.AddDate(0, 0, 15) // 2026-01-16，承诺到期时刻
+	day31 := purchase.AddDate(0, 0, 31) // 2026-02-01，已过保修截止
+
+	// 登记：产品保修三十天，故障 NOISE 未命中除外清单；备件初始库存十二件。
+	must(s.RegisterProduct("P1", purchase, 30, []string{"BROKEN_SEAL"}))
+	must(s.RegisterPart("PART-A", 12))
+	must(s.SubmitRequest("REQ-1", "P1", "NOISE"))
+	// 另一张请求关联尚未登记的产品：请求能保存，资格查询时才报产品缺失。
+	must(s.SubmitRequest("REQ-2", "P-MISSING", "NOISE"))
+
+	// 购买后第五天预留七件，承诺在购买后第十五天到期。
+	c, err := s.Reserve("COMMIT-1", "REQ-1", "PART-A", 7, day15, day5)
+	must(err)
+	fmt.Printf("reserve      : %s request=%s qty=%d used=%d\n", c.ID, c.RequestID, c.Quantity, c.Used)
+
+	// 当天领取三件：扣减承诺未用数量与实物库存。
+	u, err := s.Use("USE-1", "COMMIT-1", 3, day5)
+	must(err)
+	fmt.Printf("use          : %s %s %d\n", u.ID, u.CommitmentID, u.Quantity)
+
+	// 领取后：实物剩余九件（十二减三），有效占用四件（七减三），可承诺五件。
+	ps, err := s.PartStatus("PART-A", day5)
+	must(err)
+	fmt.Println("stock        :", ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable)
+
+	// 购买后第三十一天直接查询资格。这是一次正常、成功的查询（err 为 nil）：
+	// “不合格”是查询结果 Eligible=false，调用本身并不返回 ErrIneligible。
+	e, err := s.Evaluate("REQ-1", day31)
+	must(err)
+	fmt.Printf("evaluate     : err=%v eligible=%v reasons=%v\n", err, e.Eligible, e.Reasons)
+	// 购买时刻、保修天数和保修截止时刻仍反映登记资料，与查询时刻无关。
+	fmt.Printf("basis        : purchase=%s days=%d expiry=%s excluded=%v\n",
+		e.PurchaseTime.Format("2006-01-02"), e.WarrantyDays,
+		e.WarrantyExpiry.Format("2006-01-02"), e.Excluded)
+
+	// 直接资格查询不确认承诺到期：虽已过承诺到期时刻（第十五天），按编号取回的
+	// 仍是尚未确认到期、尚未取消的原记录：原数量七件、已用三件、未用四件。
+	c, err = s.Commitment("COMMIT-1")
+	must(err)
+	fmt.Printf("commitment   : %s qty=%d used=%d unused=%d expired=%v canceled=%v\n",
+		c.ID, c.Quantity, c.Used, c.Unused(), c.Expired, c.Canceled)
+
+	// 使用明细原样保留：只有一次三件的成功领取，数量之和即已用数量。
+	us, err := s.CommitmentUsages("COMMIT-1")
+	must(err)
+	items := make([]string, 0, len(us))
+	usedTotal := 0
+	for _, x := range us {
+		items = append(items, fmt.Sprintf("%s=%d", x.ID, x.Quantity))
+		usedTotal += x.Quantity
+	}
+	fmt.Printf("usages       : %v total=%d\n", items, usedTotal)
+
+	// 预留历史仍是成功预留那一条：直接资格查询不追加历史。
+	h, err := s.RequestHistory("REQ-1")
+	must(err)
+	fmt.Println("history      : len =", len(h), "first success =", h[0].Success)
+
+	// 用早于承诺到期的时刻核对库存（该时刻不会确认到期）：仍是九、四、五——
+	// 直接资格查询没有释放未用占用，也没有改变实物库存或已用数量。
+	ps, err = s.PartStatus("PART-A", day5)
+	must(err)
+	fmt.Println("stock        :", ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable)
+
+	// 失败的直接资格查询同样不改动承诺或库存：
+	// 空请求编号返回 ErrInvalidParam；请求未登记、或请求已登记但关联产品未登记，
+	// 都返回 ErrNotFound。
+	_, err = s.Evaluate("", day31)
+	expectErr(err, warranty.ErrInvalidParam)
+	fmt.Println("empty id     : ErrInvalidParam")
+	_, err = s.Evaluate("REQ-MISSING", day31)
+	expectErr(err, warranty.ErrNotFound)
+	fmt.Println("missing req  : ErrNotFound")
+	_, err = s.Evaluate("REQ-2", day31)
+	expectErr(err, warranty.ErrNotFound)
+	fmt.Println("missing prod : ErrNotFound")
+
+	// 失败查询之后承诺仍未确认到期、未取消，账目保持九、四、五。
+	c, err = s.Commitment("COMMIT-1")
+	must(err)
+	fmt.Printf("commitment   : expired=%v canceled=%v qty=%d used=%d\n",
+		c.Expired, c.Canceled, c.Quantity, c.Used)
+	ps, err = s.PartStatus("PART-A", day5)
+	must(err)
+	fmt.Println("stock        :", ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable)
+
+	// 接着在第三十一天查看原请求的资格和承诺明细：这次查询才确认关联承诺到期。
+	rv, err := s.RequestView("REQ-1", day31)
+	must(err)
+	fmt.Println("view         : eligible =", rv.Eligibility.Eligible, "reasons =", rv.Eligibility.Reasons)
+	d := rv.Commitments[0]
+	fmt.Printf("view detail  : %s qty=%d used=%d unused=%d status=%s expiry=%s\n",
+		d.CommitmentID, d.OriginalQuantity, d.UsedQuantity, d.RemainingQuantity,
+		d.Status, d.Expiry.Format("2006-01-02"))
+
+	// 仓库记录已被这次查询确认到期。
+	c, err = s.Commitment("COMMIT-1")
+	must(err)
+	fmt.Printf("commitment   : expired=%v canceled=%v\n", c.Expired, c.Canceled)
+
+	// 释放的只是四件未用占用：实物仍为九件（已领取的三件不会返还），
+	// 有效占用降为零，可承诺增为九件。
+	ps, err = s.PartStatus("PART-A", day31)
+	must(err)
+	fmt.Println("stock        :", ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable)
+	d = ps.Details[0]
+	fmt.Printf("part detail  : %s qty=%d used=%d unused=%d status=%s\n",
+		d.CommitmentID, d.OriginalQuantity, d.UsedQuantity, d.RemainingQuantity, d.Status)
+}
+```
+
+程序输出：
+
+```text
+reserve      : COMMIT-1 request=REQ-1 qty=7 used=0
+use          : USE-1 COMMIT-1 3
+stock        : 9 4 5
+evaluate     : err=<nil> eligible=false reasons=[warranty_expired]
+basis        : purchase=2026-01-01 days=30 expiry=2026-01-31 excluded=false
+commitment   : COMMIT-1 qty=7 used=3 unused=4 expired=false canceled=false
+usages       : [USE-1=3] total=3
+history      : len = 1 first success = true
+stock        : 9 4 5
+empty id     : ErrInvalidParam
+missing req  : ErrNotFound
+missing prod : ErrNotFound
+commitment   : expired=false canceled=false qty=7 used=3
+stock        : 9 4 5
+view         : eligible = false reasons = [warranty_expired]
+view detail  : COMMIT-1 qty=7 used=3 unused=4 status=expired expiry=2026-01-16
+commitment   : expired=true canceled=false
+stock        : 9 0 9
+part detail  : COMMIT-1 qty=7 used=3 unused=4 status=expired
+```
+
+结果对应说明（账目中的三项依次为实物剩余 / 有效占用 / 可承诺）：
+
+- 第五天预留七件、领取三件后，账目为 `9 / 4 / 5`：实物只被成功领取扣减，
+  未用四件计入有效占用。
+- 第三十一天的 `Evaluate` 是一次成功调用（`err=<nil>`）：正常取得**不合格**的
+  资格结果，拒绝原因只有 `warranty_expired`；购买时刻、保修天数（三十天）和保修
+  截止时刻（2026-01-31）仍反映登记资料，`excluded=false`。这里的“不合格”是正常
+  查询结果，不能写成返回 `ErrIneligible`。
+- 直接查询没有确认到期：随后按编号取回的承诺仍是原数量七件、已用三件、未用四件，
+  `expired=false`、`canceled=false`；使用明细仍只有 `USE-1=3`（合计三件）；预留
+  历史仍是成功预留那一条。用早于承诺到期的时刻核对库存，账目保持 `9 / 4 / 5`——
+  直接资格查询没有释放未用占用，也没有改变实物库存、已用数量或预留历史。
+- 空请求编号返回 `ErrInvalidParam`；未登记的请求返回 `ErrNotFound`；已登记但关联
+  产品未登记的请求同样返回 `ErrNotFound`。这些失败之后承诺仍未确认到期、未取消，
+  账目依旧 `9 / 4 / 5`：失败的直接查询同样不修改承诺或库存。
+- 第三十一天的 `RequestView` 才确认关联承诺到期：资格仍然过保（原因只有
+  `warranty_expired`），明细保留原数量七件、已用三件、未用四件，状态变为
+  `expired`；仓库记录的到期标记随之置位。
+- 到期确认后账目为 `9 / 0 / 9`：释放的只是四件**未用占用**，已经领取的三件实物
+  不会返还，因此实物仍为九件，而有效占用清零、可承诺增为九件。过保不代表承诺已
+  取消或库存已释放——资格判断与承诺到期确认是两种操作。
+
 ## 规则要点
 
 - 产品、备件、请求编号重复登记一律报错（`ErrDuplicateID`）且保留原记录。
@@ -1485,6 +1708,14 @@ unknown id : ErrNotFound
 - 两类查询仍保留过期承诺的原数量、已用数量、未用数量和到期时刻；未取消的
   到期记录持续显示 expired，已取消的记录仍显示 canceled；从仓库取回当前
   承诺后按较早时刻查看，状态也保持到期。重复取消不再释放数量。
+- 直接资格查询 `Evaluate` 是纯只读操作：只按本次时刻返回资格依据与拒绝原因，
+  不确认任何承诺到期、不释放未用占用、不改变实物库存或承诺已用数量、不写入取消
+  标记，也不追加预留历史；即使本次时刻晚于关联承诺的到期时刻也如此。产品资料
+  齐全时它始终正常返回、`err` 为 nil：过保或命中除外是 `Eligible=false` 的正常
+  查询结果（原因见 `Reasons`），不是 `ErrIneligible`；购买时刻、保修天数与保修
+  截止时刻始终反映登记资料。空请求编号返回 `ErrInvalidParam`，请求未登记或其
+  关联产品未登记返回 `ErrNotFound`，这些失败同样不修改承诺或库存。要在查询资格
+  的同时确认关联承诺到期、释放未用占用，应使用 `RequestView`。
 - 按承诺编号取回记录（`Commitment`）是只读的副本操作：不确认到期、不释放
   占用；对取回的 `Commitment` 调用 `Status(now)` 只是对手中记录按给定时刻
   给出显示结果（active/canceled/expired），不回写 `Expired` 标记——显示
