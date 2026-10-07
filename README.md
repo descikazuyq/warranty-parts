@@ -181,6 +181,270 @@ func main() {
 沿用 `COMMIT-1` 与原预留内容成功，账目变为 `10 / 3 / 7`；历史增至两条，旧失败
 记录原样保留、成功记录的库存依据为新增占用前的 `10 / 0 / 10`。
 
+## 产品和保修请求已经登记，备件稍后登记
+
+典型流程把备件登记放在预留之前，但调用方也可能先申请一个尚未登记的备件：
+`Reserve` 不会因为备件编号没见过就替调用方登记它。这里要区分三件事：
+
+- **请求符合保修资格**：产品资料存在，且按当次当前时刻判断购买时刻已到、
+  保修期未结束、故障代码未命中除外。它与备件是否登记无关——备件缺失期间
+  直接查资格（`Evaluate`）、按请求查看（`RequestView`）照样合格。
+- **备件资料存在**：备件编号已由 `RegisterPart` 登记、带有初始库存。参数合法
+  但备件尚未登记的预留返回 `ErrNotFound`：不自动创建备件或承诺，也不占用
+  承诺编号。缺少备件既不能解释成请求不合格，也不能解释成备件已登记但库存
+  为零——历史记录中资格依据与库存依据都明确为空（nil），即使产品资料完整、
+  资格本来合格，这条提前失败的记录也不回填合格依据。
+- **已经预留成功**：承诺编号由首次成功的 `Reserve` 绑定。备件缺失期间的失败
+  提交不占用编号，因此补登库存后无需重新提交请求，沿用原承诺编号、原备件、
+  原数量和原到期时刻（仍晚于当次当前时刻）再次提交即可成功；登记备件本身
+  不会替此前的申请预留数量。
+
+历史按处理次序保留每一次提交：先前的 `part_not_found` 失败记录（含提交的
+承诺编号、备件、数量、到期时刻与当次当前时刻）原样保留，空依据不被后来的
+成功补填或覆盖；成功记录追加在后，其库存依据是新增占用之前的账目。
+
+下面是可直接采用的完整示例，全程使用同一个仓库实例与固定时刻：先登记购买
+时间已到、保修三十天且故障未被除外的产品并保存请求，暂不登记所需备件；在
+保修期内完成一次必然失败的三件预留，随后为原备件编号补登五件库存，沿用原
+承诺编号与原预留内容再次预留成功，并通过历史看到失败与成功两条记录各自的
+依据。
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/descikazuyq/warranty-parts/warranty"
+)
+
+func main() {
+	s := warranty.NewStore()
+	// must 用于预期成功的操作：遇到意外错误立即停止，不继续输出成功结果。
+	must := func(err error) {
+		if err != nil {
+			panic(err)
+		}
+	}
+	// expectErr 用于预期失败分支：错误必须恰好是目标原因，否则同样立即停止，
+	// 不把真正的意外错误当成“预期失败”略过。
+	expectErr := func(err error, target error) {
+		if !errors.Is(err, target) {
+			panic(fmt.Sprintf("want %v, got %v", target, err))
+		}
+	}
+
+	// 固定时刻：2026-01-01 购买，保修三十天；两次预留的当前时刻都在保修期内，
+	// 承诺到期时刻晚于两次当前时刻。
+	purchase := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	firstAt := purchase.AddDate(0, 0, 10)  // 2026-01-11，备件缺失期间的当前时刻
+	secondAt := purchase.AddDate(0, 0, 11) // 2026-01-12，补登库存后的当前时刻
+	expiry := purchase.AddDate(0, 0, 40)   // 2026-02-10，晚于两次当前时刻
+
+	// 先登记产品与请求：购买时刻已到、保修三十天、NOISE 不在除外清单中；
+	// 备件 PART-A 暂不登记。
+	must(s.RegisterProduct("P1", purchase, 30, []string{"BROKEN_SEAL"}))
+	must(s.SubmitRequest("REQ-1", "P1", "NOISE"))
+
+	// 备件确实尚未登记。
+	_, err := s.Part("PART-A")
+	expectErr(err, warranty.ErrNotFound)
+
+	// 资格合格与备件资料存在是两件事：备件缺失期间直接查资格仍合格，
+	// 按请求查看也没有关联承诺。
+	e, err := s.Evaluate("REQ-1", firstAt)
+	must(err)
+	fmt.Println(e.Eligible, len(e.Reasons)) // true 0
+	rv, err := s.RequestView("REQ-1", firstAt)
+	must(err)
+	fmt.Println(rv.Eligibility.Eligible, len(rv.Commitments)) // true 0
+
+	// 参数合法的三件预留（数量为正、到期时刻晚于当次时刻，失败原因确实只是
+	// 备件未登记）：返回 ErrNotFound，不自动创建备件或承诺，也不占用承诺编号。
+	_, err = s.Reserve("COMMIT-1", "REQ-1", "PART-A", 3, expiry, firstAt)
+	expectErr(err, warranty.ErrNotFound)
+	_, err = s.Part("PART-A")
+	expectErr(err, warranty.ErrNotFound) // 备件没有被自动创建
+	_, err = s.Commitment("COMMIT-1")
+	expectErr(err, warranty.ErrNotFound) // 失败不占用承诺编号
+
+	// 失败后原请求资格仍合格、仍无关联承诺：缺少备件不等于请求不合格，
+	// 也不等于备件已登记但库存为零。
+	rv, err = s.RequestView("REQ-1", firstAt)
+	must(err)
+	fmt.Println(rv.Eligibility.Eligible, len(rv.Commitments)) // true 0
+
+	// 历史留下一条失败记录：类别 part_not_found，保留提交内容与当次时刻；
+	// 即使产品资料完整、资格本来合格，资格依据与库存依据也均为 nil——
+	// 尚未登记的备件不能解释成零库存，失败记录也不回填合格依据。
+	h, err := s.RequestHistory("REQ-1")
+	must(err)
+	fmt.Println(len(h), h[0].Success, h[0].Error) // 1 false part_not_found
+	fmt.Println(h[0].CommitID, h[0].PartID, h[0].Quantity,
+		h[0].Expiry.Equal(expiry), h[0].Now.Equal(firstAt)) // COMMIT-1 PART-A 3 true true
+	fmt.Println(h[0].Eligibility == nil, h[0].StockBasis == nil) // true true
+
+	// 为原备件编号补登五件库存：登记本身不替此前的申请预留数量，
+	// 账目先是实物五件、有效占用零件、可承诺五件。
+	must(s.RegisterPart("PART-A", 5))
+	ps, err := s.PartStatus("PART-A", secondAt)
+	must(err)
+	fmt.Println(ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable) // 5 0 5
+
+	// 原请求无需重新提交：资格仍合格，关联承诺列表仍为空。
+	rv, err = s.RequestView("REQ-1", secondAt)
+	must(err)
+	fmt.Println(rv.Eligibility.Eligible, len(rv.Commitments)) // true 0
+
+	// 沿用原承诺编号、原备件、三件数量和原到期时刻再次预留：成功。
+	// 编号能沿用，是因为此前从未预留成功、失败不占用编号。
+	c, err := s.Reserve("COMMIT-1", "REQ-1", "PART-A", 3, expiry, secondAt)
+	must(err)
+	fmt.Println(c.ID, c.RequestID, c.Quantity, c.Used) // COMMIT-1 REQ-1 3 0
+
+	// 预留不扣实物：账目变为实物五件、有效占用三件、可承诺两件。
+	ps, err = s.PartStatus("PART-A", secondAt)
+	must(err)
+	fmt.Println(ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable) // 5 3 2
+
+	// 历史保留先前失败并追加成功：旧失败记录的空依据不被补填或覆盖；
+	// 成功记录的资格依据为当次合格，库存依据是新增占用前的五、零、五。
+	h, err = s.RequestHistory("REQ-1")
+	must(err)
+	fmt.Println(len(h))                                            // 2
+	fmt.Println(h[0].Seq, h[0].Success, h[0].Error)                // 1 false part_not_found
+	fmt.Println(h[0].Eligibility == nil, h[0].StockBasis == nil)   // true true（旧记录不补填）
+	fmt.Println(h[1].Seq, h[1].Success, h[1].Eligibility.Eligible) // 2 true true
+	b := h[1].StockBasis
+	fmt.Println(b.PhysicalRemaining, b.ActiveOccupied, b.Committable) // 5 0 5
+}
+```
+
+程序输出：
+
+```text
+true 0
+true 0
+true 0
+1 false part_not_found
+COMMIT-1 PART-A 3 true true
+true true
+5 0 5
+true 0
+COMMIT-1 REQ-1 3 0
+5 3 2
+2
+1 false part_not_found
+true true
+2 true true
+5 0 5
+```
+
+结果对应说明（账目中的三项依次为实物剩余 / 有效占用 / 可承诺）：
+
+- 备件缺失期间资格查询与请求视图都显示合格且无承诺；三件预留返回
+  `ErrNotFound` 后，备件仍未登记、承诺编号查询不到，请求视图依旧合格且无
+  承诺——缺少备件不等于请求不合格，也不等于已登记的零库存。
+- 历史第一条为 `part_not_found`：保留提交的承诺编号、备件、三件数量、到期
+  时刻与当次当前时刻，资格依据与库存依据均为 `nil`；产品资料完整不代表这条
+  失败记录必须带有合格依据。
+- 补登五件库存后账目为 `5 / 0 / 5`：登记本身不替此前的申请预留数量，原请求
+  无需重新提交。沿用 `COMMIT-1` 与原预留内容再次预留成功，账目变为
+  `5 / 3 / 2`（预留不扣实物）。
+- 历史增至两条：旧的 `part_not_found` 记录原样保留、空依据不被补填或覆盖；
+  成功记录的资格依据为当次合格，库存依据是新增占用前的 `5 / 0 / 5`。
+
+补登的库存也可能不够。下面是独立示例（另一个仓库实例）：同样在备件缺失
+期间申请三件并被拒绝，随后只登记两件库存，再沿用原提交内容申请三件，返回
+`ErrInsufficientStock`——整次失败，没有部分承诺，账目保持 `2 / 0 / 2`，
+历史追加当次失败与真实依据。
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/descikazuyq/warranty-parts/warranty"
+)
+
+func main() {
+	s := warranty.NewStore()
+	must := func(err error) {
+		if err != nil {
+			panic(err)
+		}
+	}
+	expectErr := func(err error, target error) {
+		if !errors.Is(err, target) {
+			panic(fmt.Sprintf("want %v, got %v", target, err))
+		}
+	}
+
+	// 与主例相同的固定时刻：保修期内的两次预留时刻与更晚的到期时刻。
+	purchase := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	firstAt := purchase.AddDate(0, 0, 10)
+	secondAt := purchase.AddDate(0, 0, 11)
+	expiry := purchase.AddDate(0, 0, 40)
+
+	must(s.RegisterProduct("P1", purchase, 30, []string{"BROKEN_SEAL"}))
+	must(s.SubmitRequest("REQ-1", "P1", "NOISE"))
+
+	// 备件缺失期间先申请三件：返回 ErrNotFound，留下 part_not_found 记录。
+	_, err := s.Reserve("COMMIT-1", "REQ-1", "PART-A", 3, expiry, firstAt)
+	expectErr(err, warranty.ErrNotFound)
+
+	// 只登记两件库存，不足申请的三件。
+	must(s.RegisterPart("PART-A", 2))
+
+	// 沿用原承诺编号、原备件、三件数量和原到期时刻再次预留：
+	// 返回 ErrInsufficientStock，整次失败——没有部分承诺，也不占用承诺编号。
+	_, err = s.Reserve("COMMIT-1", "REQ-1", "PART-A", 3, expiry, secondAt)
+	expectErr(err, warranty.ErrInsufficientStock)
+	_, err = s.Commitment("COMMIT-1")
+	expectErr(err, warranty.ErrNotFound) // 失败仍不占用编号
+
+	// 账目保持两件实物、零件占用、两件可承诺：不是先占用两件、第三件被拒。
+	ps, err := s.PartStatus("PART-A", secondAt)
+	must(err)
+	fmt.Println(ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable) // 2 0 2
+
+	// 历史两条：旧的 part_not_found 原样保留在前；本次追加
+	// insufficient_stock，保存当次合格资格与真实库存依据 2/0/2。
+	h, err := s.RequestHistory("REQ-1")
+	must(err)
+	fmt.Println(len(h))                                            // 2
+	fmt.Println(h[0].Seq, h[0].Success, h[0].Error)                // 1 false part_not_found
+	fmt.Println(h[0].Eligibility == nil, h[0].StockBasis == nil)   // true true
+	fmt.Println(h[1].Seq, h[1].Success, h[1].Error)                // 2 false insufficient_stock
+	fmt.Println(h[1].Eligibility.Eligible)                         // true
+	b := h[1].StockBasis
+	fmt.Println(b.PhysicalRemaining, b.ActiveOccupied, b.Committable) // 2 0 2
+}
+```
+
+程序输出：
+
+```text
+2 0 2
+2
+1 false part_not_found
+true true
+2 false insufficient_stock
+true
+2 0 2
+```
+
+库存不足与备件缺失是两种不同的失败：备件尚未登记时依据为空
+（`part_not_found`，两类依据均 `nil`）；备件已登记但数量不够时记录当次
+真实依据——`insufficient_stock` 记录的资格依据为当次合格，库存依据为
+`2 / 0 / 2`。两次失败都是整次失败：不创建承诺、不做部分占用、不占用承诺
+编号，此前失败的记录也原样保留。
+
 ## 过保后继续使用既有承诺
 
 保修资格的期限与承诺预留的期限是两个互相独立的时刻，分别约束不同环节，
