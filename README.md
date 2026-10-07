@@ -21,11 +21,16 @@ _ = s.RegisterPart("PART-A", 100)
 _ = s.SubmitRequest("REQ-1", "P1", "NOISE")
 
 // 2. 按当次时刻预留承诺：每次首次预留都重新判断资格；到期时刻必须晚于当前时刻。
-//    同一编号原样重试（请求、备件、数量、到期时刻一致；当前时刻不属于提交内容）
-//    始终取回首次成功时的承诺快照，与本次当前时刻及承诺后来的使用、取消、到期无关。
+//    编号只由首次成功预留绑定：失败提交不占用编号，修正内容后可沿用原编号重新
+//    提交。已经成功预留的编号原样重试（请求、备件、数量、到期时刻一致；当前时刻
+//    不属于提交内容）始终取回首次成功时的承诺快照，与本次当前时刻及承诺后来的
+//    使用、取消、到期无关；换内容则报 ErrConflict。
 c, err := s.Reserve("COMMIT-1", "REQ-1", "PART-A", 10, expiry, now)
 
-// 3. 分批使用：每次带全局唯一使用编号，扣减承诺未用数量与实物库存。
+// 3. 分批使用：每次带全局唯一使用编号，扣减承诺未用数量与实物库存。编号同样只由
+//    首次成功使用绑定：超量（ErrUsageExceeded）等失败提交不扣减、不占用编号，
+//    把数量改成合法值后可沿用原编号继续领取；成功后原样重试取回首次使用记录，
+//    换承诺或数量报 ErrConflict。
 u, err := s.Use("USE-1", "COMMIT-1", 4, now)
 
 // 4. 取消：只释放未用数量；到期自动失效并释放余量，无需另做清理。
@@ -283,6 +288,194 @@ func main() {
 变为 `8 / 2 / 6`，承诺明细为 `4 / 2 / 2 active`；到达承诺到期时刻，`USE-2`
 返回 `ErrCommitmentClosed`，账目变为 `8 / 0 / 8`，明细保留 `4 / 2 / 2 expired`。
 到期释放的只是未用的两件占用，已经领走的两件实物不会因此回到库存。
+
+## 超量领取被拒绝后，沿用原使用编号改为合法数量
+
+分批使用的编号何时才算“用掉”，直接决定一次领取被拒绝后要不要更换编号。规则
+只有一条：**使用编号只由首次成功的 `Use` 确定**（预留编号同理，只由首次成功的
+`Reserve` 确定）。在那次成功提交之前，编号不属于任何承诺、也不记得任何数量：
+
+- 一次新使用因为数量超过**这笔承诺自己的未用数量**而返回 `ErrUsageExceeded`
+  时，是**整次失败**：不先扣掉允许的部分，不改变承诺已用数量与实物库存，也不
+  写入成功使用记录。即使仓库实物仍然充足、同一备件的其他承诺还有未用余量，也
+  不能挪用到这笔承诺上——不能把它理解成“先领走允许的三件、第四件被拒”。
+- 因此被拒绝的编号**仍是一个从未成功过的编号**：失败提交不保存成功使用记录，
+  编号没有绑定到这笔承诺，被拒绝的数量也不会成为日后的冲突依据。沿用同一编号、
+  仍指向同一承诺，把数量改成未用数量以内重新提交，就是一笔合法的新使用，正常
+  扣减。
+- 编号一旦随某次成功提交绑定（记住承诺编号与数量；当前时刻不属于绑定内容），
+  规则才切换为幂等：同编号同内容始终取回首次成功结果、不再扣减，也不增加明细；
+  此后再改承诺编号或数量才报 `ErrConflict`——哪怕改回的是这个编号**成功之前**
+  曾被业务拒绝过的数量，也一样冲突：冲突比对的是首次**成功**的内容，被拒绝过
+  的数量从不曾占据编号。
+
+下面是可直接采用的完整示例，全程使用同一个仓库实例与固定时刻：产品始终在保、
+故障代码不在除外清单中，承诺全程未取消且未到期。登记十件备件，为一个已知请求
+预留五件，先用另一个使用编号成功领取两件，使承诺已用两件、未用三件，实物剩余
+八件、有效占用三件、可承诺五件。随后用一个从未成功过的使用编号领取四件，即使
+实物足够，也应得到 `ErrUsageExceeded`，整次不扣减；再沿用该编号把数量改成三件
+成功领取，原样重试取回同一结果，最后改回最初被拒的四件则得到 `ErrConflict`。
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/descikazuyq/warranty-parts/warranty"
+)
+
+func main() {
+	s := warranty.NewStore()
+	// must 用于预期成功的操作：遇到意外错误立即停止，不继续输出成功结果。
+	must := func(err error) {
+		if err != nil {
+			panic(err)
+		}
+	}
+	// expectErr 用于预期拒绝：错误必须恰好是目标原因，否则立即停止，
+	// 不把真正的意外错误当成“预期拒绝”略过。
+	expectErr := func(err error, target error) {
+		if !errors.Is(err, target) {
+			panic(fmt.Sprintf("want %v, got %v", target, err))
+		}
+	}
+
+	// 固定时刻：2026-01-01 购买、保修三十天，全部操作都取保修期内的同一时刻，
+	// 承诺到期时刻晚于该时刻；故障代码 NOISE 不命中除外清单，承诺全程未取消、
+	// 未到期。
+	purchase := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	now := purchase.AddDate(0, 0, 10)    // 2026-01-11，全程使用同一当前时刻
+	expiry := purchase.AddDate(0, 0, 40) // 2026-02-10，晚于全部操作时刻
+
+	// show 一次输出承诺数量（原定/已用/未用）与备件账目的三项数量。
+	show := func(label string) {
+		c, err := s.Commitment("COMMIT-1")
+		must(err)
+		ps, err := s.PartStatus("PART-A", now)
+		must(err)
+		fmt.Printf("%-8s commit=%d/%d/%d physical=%d occupied=%d committable=%d\n",
+			label, c.Quantity, c.Used, c.Unused(),
+			ps.PhysicalRemaining, ps.ActiveOccupied, ps.Committable)
+	}
+	// usages 输出该承诺的成功使用明细与合计；失败提交不出现在这里。
+	usages := func(label string) {
+		list, err := s.CommitmentUsages("COMMIT-1")
+		must(err)
+		items := make([]string, 0, len(list))
+		total := 0
+		for _, u := range list {
+			items = append(items, fmt.Sprintf("%s=%d", u.ID, u.Quantity))
+			total += u.Quantity
+		}
+		fmt.Printf("%-8s usages=%v total=%d\n", label, items, total)
+	}
+
+	// 登记：十件备件；产品始终在保，故障代码 NOISE 不在除外清单中。
+	must(s.RegisterProduct("P1", purchase, 30, []string{"BROKEN_SEAL"}))
+	must(s.RegisterPart("PART-A", 10))
+	must(s.SubmitRequest("REQ-1", "P1", "NOISE"))
+
+	// 为已知请求预留五件。
+	_, err := s.Reserve("COMMIT-1", "REQ-1", "PART-A", 5, expiry, now)
+	must(err)
+
+	// 先用另一个使用编号成功领取两件。
+	u2, err := s.Use("USE-A", "COMMIT-1", 2, now)
+	must(err)
+	fmt.Printf("use      : %s %s %d\n", u2.ID, u2.CommitmentID, u2.Quantity)
+
+	// 承诺已用两件、未用三件；实物剩余八件、有效占用三件、可承诺五件。
+	show("seed:")
+	usages("seed:")
+
+	// 用一个从未成功过的使用编号领取四件：该承诺自己的未用数量只有三件，
+	// 即使仓库实物还剩八件也不能挪用，返回 ErrUsageExceeded；整次不扣减，
+	// 不能先领走允许的三件，被拒绝的数量也不会成为之后的冲突依据。
+	_, err = s.Use("USE-B", "COMMIT-1", 4, now)
+	exceeded := errors.Is(err, warranty.ErrUsageExceeded)
+	expectErr(err, warranty.ErrUsageExceeded)
+	fmt.Println("rejected : ErrUsageExceeded =", exceeded)
+
+	// 承诺数量与三项库存账目保持原值；成功使用明细仍只有此前两件的记录。
+	show("refused:")
+	usages("refused:")
+
+	// 沿用刚才失败的编号，仍指向原承诺，把数量改成三件：这是一笔合法的新
+	// 使用，成功返回这次使用的编号、承诺编号和数量。
+	u3, err := s.Use("USE-B", "COMMIT-1", 3, now)
+	must(err)
+	fmt.Printf("use      : %s %s %d\n", u3.ID, u3.CommitmentID, u3.Quantity)
+
+	// 承诺累计已用五件、未用零件；账目变为实物五件、有效占用零件、可承诺
+	// 五件；成功使用明细只包含两件和三件这两次领取，合计五件。
+	show("filled:")
+	usages("filled:")
+
+	// 再次按相同编号、承诺和三件数量提交：取回同一成功结果，不再扣减，
+	// 也不增加明细。
+	again, err := s.Use("USE-B", "COMMIT-1", 3, now)
+	must(err)
+	fmt.Printf("retry    : %s %s %d same=%v\n",
+		again.ID, again.CommitmentID, again.Quantity, again == u3)
+	show("again:")
+	usages("again:")
+
+	// 把数量改回最初被拒绝的四件：编号此刻已由三件的成功使用绑定，
+	// 返回 ErrConflict；三件的成功结果和账目都保留。
+	_, err = s.Use("USE-B", "COMMIT-1", 4, now)
+	conflict := errors.Is(err, warranty.ErrConflict)
+	expectErr(err, warranty.ErrConflict)
+	fmt.Println("changed  : ErrConflict =", conflict)
+	show("kept:")
+	usages("kept:")
+}
+```
+
+程序输出：
+
+```text
+use      : USE-A COMMIT-1 2
+seed:    commit=5/2/3 physical=8 occupied=3 committable=5
+seed:    usages=[USE-A=2] total=2
+rejected : ErrUsageExceeded = true
+refused: commit=5/2/3 physical=8 occupied=3 committable=5
+refused: usages=[USE-A=2] total=2
+use      : USE-B COMMIT-1 3
+filled:  commit=5/5/0 physical=5 occupied=0 committable=5
+filled:  usages=[USE-A=2 USE-B=3] total=5
+retry    : USE-B COMMIT-1 3 same=true
+again:   commit=5/5/0 physical=5 occupied=0 committable=5
+again:   usages=[USE-A=2 USE-B=3] total=5
+changed  : ErrConflict = true
+kept:    commit=5/5/0 physical=5 occupied=0 committable=5
+kept:    usages=[USE-A=2 USE-B=3] total=5
+```
+
+结果对应说明（`commit=` 后三项依次为承诺原定 / 已用 / 未用，库存三项依次为
+实物剩余 / 有效占用 / 可承诺）：
+
+- 预留五件、再用 `USE-A` 领取两件后，`seed:` 为承诺 `5 / 2 / 3`、库存
+  `8 / 3 / 5`：实物只被成功领取扣减，未用三件仍计入有效占用，可承诺为五件；
+  成功使用明细只有 `USE-A=2`。
+- 从未成功过的 `USE-B` 领取四件返回 `ErrUsageExceeded`（`rejected: true`）：
+  这笔承诺自己的未用数量只有三件，虽然实物还剩八件也不能挪用，更没有“先领三件”；
+  `refused:` 与 `seed:` 完全相同，明细仍只有两件的记录。这里区分得很清楚：它是
+  **使用超量**的业务拒绝，不是编号冲突——编号此刻还未被占用。
+- 沿用同一编号 `USE-B`、仍指向 `COMMIT-1`、数量改成三件后成功，返回
+  `USE-B COMMIT-1 3`：失败提交没有保存成功记录，先前被拒的四件不构成冲突依据。
+  `filled:` 为承诺 `5 / 5 / 0`、库存 `5 / 0 / 5`（实物再扣三件降到五件，未用
+  占用同步清零，故可承诺仍为五件）；明细只含 `USE-A=2`、`USE-B=3` 两次领取，
+  合计五件。
+- 按相同编号、承诺和三件数量再次提交，取回的是同一条成功结果（`same=true`），
+  不再扣减、不增加明细：`again:` 的账目与明细都与 `filled:` 相同。
+- 把数量改回**最初被拒绝的四件**，此时返回 `ErrConflict`（`changed: true`）：
+  编号已经由三件的成功使用绑定，冲突比对的是首次成功内容；被拒绝的四件在成功
+  之前不占编号，在成功之后也不能覆盖或改写首次结果。`kept:` 中三件的成功结果、
+  `5 / 5 / 0` 的承诺数量与 `5 / 0 / 5` 的库存账目全部保留，明细仍是合计五件的
+  两条记录。
 
 ## 取消已部分使用的承诺：释放预留占用，不收回实物
 
@@ -1035,8 +1228,13 @@ unknown id : ErrNotFound
   记录或用 `PartStatus`、`RequestView` 核对；此前保存的旧副本不随后续确认
   更新，按早于到期的时刻仍可能显示 active，不能替代重新查询。已取消记录始终
   显示 canceled，未知承诺编号取回返回 ErrNotFound。
-- 预留与使用均支持幂等重试：同编号同内容返回首次结果，换内容报
-  `ErrConflict`；成功的使用在承诺取消或到期后重试仍返回原结果。
+- 编号只由首次成功的提交确定：预留编号看首次成功预留，使用编号看首次成功使用；
+  在那次成功之前，编号都不与任何内容绑定——参数非法、引用对象不存在、资格不合格、
+  库存不足、使用超量、承诺已取消或到期等失败提交都不保存成功记录、不占用编号。
+  尚未成功的编号按本次内容修正后，可以沿用原编号继续向同一承诺（或改指向其他合法
+  对象）提交，原先被拒绝的内容不成为冲突依据。只有编号已经成功过之后，同编号同内容
+  的重试才返回首次结果、不重复扣减或占用；换内容才报 `ErrConflict`（即使新内容本身
+  非法也按冲突处理）。成功的使用在承诺取消或到期后重试仍返回原结果。
 - 已成功预留的编号原样重试（承诺编号、请求编号、备件编号、数量、到期时刻一致；
   本次当前时刻不属于提交内容，到期时刻按实际时刻比较，换时区表示仍算一致）始终
   返回首次预留成功时的完整承诺（已用数量为零、未取消）：即使请求后来过保、库存
@@ -1046,8 +1244,14 @@ unknown id : ErrNotFound
 - 已成功预留的编号只要改了请求、备件、数量或到期时刻任一项即返回 `ErrConflict`，
   即使新参数本身非法（空请求、未知备件、零数量、已过去的到期时刻）也按编号冲突
   处理；冲突失败记录挂到本次指定的已知请求下，请求为空或不存在时不创建请求和
-  历史。尚未成功占用的编号继续按本次参数、资格和库存判断，失败后可再次提交。
-- 使用数量超过承诺未用数量时整次失败；已全部使用的承诺不再接受新使用。
+  历史。**冲突规则只对已经成功预留过的编号生效**：尚未成功预留的编号（包括此前
+  任何一次失败提交用过的编号）继续按本次参数、资格和库存判断，失败后可沿用同一
+  编号再次提交，先前被拒绝的内容不构成冲突依据。
+- 使用数量超过承诺未用数量时整次失败，返回 `ErrUsageExceeded`：不先扣允许的
+  部分、不改变承诺已用数量与实物库存，也不保存成功使用记录；这是尚未成功的
+  编号，失败不占用编号、不绑定承诺，被拒绝的数量不成为之后的冲突依据——沿用
+  同一编号、仍指向同一承诺、把数量改成未用数量以内即可成功。已全部使用的承诺
+  不再接受新使用。
 - 同一承诺编号在首次成功预留前被不同内容（不同请求、备件、数量或到期时刻）
   并发抢占时，只能有一份内容成为首次承诺：与其完全相同的提交全部成功并返回
   同一份完整首次承诺（已用数量为零、未取消），另一组全部返回 `ErrConflict`，
@@ -1068,6 +1272,7 @@ unknown id : ErrNotFound
   不能两组各自成功；最终扣减量只对应胜出的那一份提交，落败承诺保持未使用，赛后
   按胜出内容重试取回原记录、按落败内容重试仍冲突，冲突不覆盖记录也不额外扣减。
 - 历史只保存在当前仓库实例中：每个请求的记录按处理次序排列、序号严格递增，
-  与提交时刻无关；成功与失败提交都留痕，同编号同内容重试不追加历史；
-  冲突失败记录挂到本次提交指定的已知请求；资格或备件缺失时依据明确为空，
-  不用合格或零库存替代缺失；查询返回副本，修改不影响已保存历史。
+  与提交时刻无关；每次首次预留成功及每次失败提交都留痕（同一编号失败后以相同
+  或不同内容再次提交且仍失败，各追加一条），只有已成功编号的同内容幂等重试不
+  追加历史；冲突失败记录挂到本次提交指定的已知请求；资格或备件缺失时依据明确
+  为空，不用合格或零库存替代缺失；查询返回副本，修改不影响已保存历史。
